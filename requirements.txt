@@ -1,0 +1,4 @@
+# YouTube Music Sync & Downloader Dependencies
+yt-dlp>=2024.0.0
+mutagen>=1.47.0
+PyQt6>=6.5.0
