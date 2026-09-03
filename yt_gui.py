@@ -1448,14 +1448,16 @@ def _open_browser(url: str):
         webbrowser.open(url)
         return
 
-    # Linux / macOS – try app-mode browser in preference order
+    # Linux / macOS – Chromium gives the best --app= frameless window.
+    # Opera GX doesn't honour --app= the same way (opens a tab instead).
     browsers = [
-        shutil.which("opera-gx"),
-        shutil.which("opera"),
-        "/usr/bin/chromium",
+        "/usr/bin/chromium",           # Omarchy default – best --app= support
         shutil.which("chromium"),
         shutil.which("google-chrome"),
         shutil.which("brave"),
+        "/usr/bin/opera-gx",           # fallback – may open as tab
+        shutil.which("opera-gx"),
+        shutil.which("opera"),
     ]
     for b in browsers:
         if b and os.path.isfile(b):

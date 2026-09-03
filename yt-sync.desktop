@@ -1,9 +1,10 @@
 [Desktop Entry]
 Name=YouTube Sync & Downloader
 Comment=Incremental YouTube Playlist & Video Downloader
-Exec=/home/heaven/Projects/New/youtube_sync/yt_gui.py
+Exec=python3 /home/heaven/Projects/New/youtube_sync/yt_gui.py
 Icon=applications-multimedia
 Terminal=false
 Type=Application
 Categories=AudioVideo;Audio;Video;Network;
 StartupNotify=true
+StartupWMClass=chromium
