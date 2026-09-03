@@ -3,13 +3,16 @@
 ==============================================================================
 YouTube Playlist Incremental Downloader - GUI Edition (yt_gui)
 ==============================================================================
-Enhanced with:
-- Live "Now Downloading" active song widget with progress bar, speed, & stage pills
-- Playlist Preview Inspector with Synced (🟢) vs New (⚪) status indicators
-- "Download Anyway" / Force Re-download toggles (per-song & whole playlist)
-- Full Toast Notification & Visual Feedback System on every button
-- Native Linux Folder Chooser + Quick Path chips
-- Auto-shutdown on window close (Zero 24/7 background process)
+Features:
+- Live "Now Downloading" widget with progress bar, speed, & stage pills
+- Playlist Inspector with Synced (🟢) vs Pending (⚪) status
+- Per-song "Download" / "Re-download" buttons from the inspector
+- Force Re-download toggle (per-song & whole playlist)
+- Toast notification system on every action
+- Cross-platform folder picker (Qt6, PowerShell, zenity, kdialog)
+- Saved Playlist Manager with per-playlist Sync button
+- Auto-shutdown on window close (zero background process)
+- Cross-platform: Linux, macOS, Windows
 ==============================================================================
 """
 
@@ -19,8 +22,7 @@ import re
 import json
 import time
 import socket
-import select
-import signal
+import shutil
 import threading
 import subprocess
 import urllib.parse
@@ -28,270 +30,270 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
-# Configurations
-CONFIG_DIR = Path.home() / ".config" / "yt_sync"
+# ─── Config Paths ──────────────────────────────────────────────────────────────
+
+CONFIG_DIR    = Path.home() / ".config" / "yt_sync"
 PLAYLISTS_FILE = CONFIG_DIR / "playlists.json"
-ARCHIVE_FILE = CONFIG_DIR / "download_archive.txt"
+ARCHIVE_FILE  = CONFIG_DIR / "download_archive.txt"
 
-def get_default_music_dir() -> Path:
+
+def _default_music_dir() -> Path:
     if sys.platform.startswith("win"):
-        win_music = Path.home() / "Music"
-        if win_music.exists():
-            return win_music
-        return Path.home() / "Downloads" / "Music"
-    else:
-        phone_dir = Path.home() / "phone"
-        if phone_dir.exists():
-            return phone_dir
-        return Path.home() / "Music"
+        p = Path.home() / "Music"
+        return p if p.exists() else Path.home() / "Downloads" / "Music"
+    p = Path.home() / "phone"
+    return p if p.exists() else Path.home() / "Music"
 
-DEFAULT_MUSIC_DIR = get_default_music_dir()
-DEFAULT_VIDEO_DIR = Path.home() / "Videos"
+DEFAULT_MUSIC_DIR     = _default_music_dir()
+DEFAULT_VIDEO_DIR     = Path.home() / "Videos"
 DEFAULT_DOWNLOADS_DIR = Path.home() / "Downloads"
 
-def get_ytdlp_base_cmd() -> List[str]:
-    import shutil
+
+# ─── Tool Detection ────────────────────────────────────────────────────────────
+
+def get_ytdlp_cmd() -> List[str]:
     if shutil.which("yt-dlp"):
         return ["yt-dlp"]
     if sys.platform.startswith("win"):
-        script_dir = Path(__file__).resolve().parent
-        if (script_dir / "yt-dlp.exe").exists():
-            return [str(script_dir / "yt-dlp.exe")]
+        local = Path(__file__).resolve().parent / "yt-dlp.exe"
+        if local.exists():
+            return [str(local)]
     return [sys.executable, "-m", "yt_dlp"]
 
+
 def get_ffmpeg_args() -> List[str]:
-    import shutil
     if shutil.which("ffmpeg"):
         return []
-    script_dir = Path(__file__).resolve().parent
-    local_ffmpeg = script_dir / ("ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg")
-    if local_ffmpeg.exists():
-        return ["--ffmpeg-location", str(local_ffmpeg)]
+    local = Path(__file__).resolve().parent / ("ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg")
+    if local.exists():
+        return ["--ffmpeg-location", str(local)]
     return []
 
-# Global App State
-app_state = {
-    "current_process": None,
-    "is_downloading": False,
-    "current_task_name": "",
+
+# ─── App State ─────────────────────────────────────────────────────────────────
+
+app_state: Dict[str, Any] = {
+    "current_process":  None,
+    "is_downloading":   False,
+    "current_task_url": "",
     "active_download": {
-        "title": "",
+        "title":   "",
         "percent": 0.0,
-        "speed": "",
-        "eta": "",
-        "size": "",
-        "status": "Idle"
+        "speed":   "",
+        "eta":     "",
+        "size":    "",
+        "status":  "Idle",
     },
-    "log_history": [],
-    "last_heartbeat": time.time(),
+    "log_history":        [],
+    "last_heartbeat":     time.time(),
     "shutdown_requested": False,
-    "lock": threading.Lock()
+    "lock":               threading.Lock(),
 }
 
-log_subscribers = []
+_log_subscribers: List = []
+
+
+# ─── Config Helpers ────────────────────────────────────────────────────────────
 
 def ensure_config():
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     if not PLAYLISTS_FILE.exists():
-        with open(PLAYLISTS_FILE, "w", encoding="utf-8") as f:
-            json.dump([], f, indent=2)
+        PLAYLISTS_FILE.write_text("[]", encoding="utf-8")
     if not ARCHIVE_FILE.exists():
         ARCHIVE_FILE.touch()
+
 
 def get_saved_playlists() -> List[Dict]:
     ensure_config()
     try:
-        with open(PLAYLISTS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return json.loads(PLAYLISTS_FILE.read_text(encoding="utf-8"))
     except Exception:
         return []
 
+
 def save_playlists(data: List[Dict]):
     ensure_config()
-    with open(PLAYLISTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    PLAYLISTS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
 
 def get_archive_set() -> set:
     ensure_config()
     try:
-        with open(ARCHIVE_FILE, "r", encoding="utf-8") as f:
-            return {line.split()[-1] for line in f if line.strip()}
+        lines = ARCHIVE_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()
+        return {ln.split()[-1] for ln in lines if ln.strip()}
     except Exception:
         return set()
+
 
 def get_archive_count() -> int:
     return len(get_archive_set())
 
+
+# ─── Logging / SSE ─────────────────────────────────────────────────────────────
+
+def broadcast_log(text: str, log_type: str = "info"):
+    entry = {"time": time.strftime("%H:%M:%S"), "text": text, "type": log_type}
+    with app_state["lock"]:
+        app_state["log_history"].append(entry)
+        if len(app_state["log_history"]) > 800:
+            app_state["log_history"].pop(0)
+    for cb in list(_log_subscribers):
+        try:
+            cb(entry)
+        except Exception:
+            if cb in _log_subscribers:
+                _log_subscribers.remove(cb)
+
+
+# ─── Folder Picker (non-blocking wrapper) ─────────────────────────────────────
+
 def choose_folder_dialog(initial_path: str = "") -> Optional[str]:
+    """Returns selected folder or None. Runs in calling thread (POST handler thread)."""
     init_dir = os.path.expanduser(initial_path) if initial_path else str(DEFAULT_MUSIC_DIR)
     if not os.path.exists(init_dir):
         init_dir = str(Path.home())
 
-    # Try Qt File Dialog if available
+    # 1. Qt6
     try:
         from PyQt6.QtWidgets import QApplication, QFileDialog
-        app = QApplication.instance()
-        if not app:
-            app = QApplication(sys.argv)
+        app = QApplication.instance() or QApplication(sys.argv)
         chosen = QFileDialog.getExistingDirectory(None, "Select Destination Folder", init_dir)
         if chosen and os.path.exists(chosen):
             return chosen
     except Exception:
         pass
 
-    # Windows PowerShell Folder Picker fallback
+    # 2. Windows PowerShell
     if sys.platform.startswith("win"):
         try:
-            ps_script = (
-                f'[System.Reflection.Assembly]::LoadWithPartialName("System.windows.forms") | Out-Null;'
-                f'$dialog = New-Object System.Windows.Forms.FolderBrowserDialog;'
-                f'$dialog.SelectedPath = "{init_dir}";'
-                f'$dialog.Description = "Select Destination Folder";'
-                f'if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{ $dialog.SelectedPath }}'
+            ps = (
+                '[System.Reflection.Assembly]::LoadWithPartialName("System.windows.forms") | Out-Null;'
+                '$d = New-Object System.Windows.Forms.FolderBrowserDialog;'
+                f'$d.SelectedPath = "{init_dir}";'
+                '$d.Description = "Select Destination Folder";'
+                'if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $d.SelectedPath }'
             )
-            res = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
-                capture_output=True, text=True
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                capture_output=True, text=True, timeout=120,
             )
-            if res.returncode == 0 and res.stdout.strip():
-                return res.stdout.strip()
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()
         except Exception:
             pass
 
-    # Linux Zenity / Kdialog fallback
-    if Path("/usr/bin/zenity").exists():
+    # 3. zenity
+    if shutil.which("zenity"):
         try:
-            res = subprocess.run(
-                [
-                    "zenity",
-                    "--file-selection",
-                    "--directory",
-                    "--title=Select Destination Folder",
-                    f"--filename={init_dir}/"
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True
+            r = subprocess.run(
+                ["zenity", "--file-selection", "--directory",
+                 "--title=Select Destination Folder", f"--filename={init_dir}/"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=120,
             )
-            if res.returncode == 0 and res.stdout.strip():
-                return res.stdout.strip()
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()
         except Exception:
             pass
 
-    if Path("/usr/bin/kdialog").exists():
+    # 4. kdialog
+    if shutil.which("kdialog"):
         try:
-            res = subprocess.run(
+            r = subprocess.run(
                 ["kdialog", "--getexistingdirectory", init_dir, "--title", "Select Destination Folder"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=120,
             )
-            if res.returncode == 0 and res.stdout.strip():
-                return res.stdout.strip()
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()
         except Exception:
             pass
 
     return None
 
-def broadcast_log(line: str, log_type: str = "info"):
-    entry = {"time": time.strftime("%H:%M:%S"), "text": line, "type": log_type}
-    with app_state["lock"]:
-        app_state["log_history"].append(entry)
-        if len(app_state["log_history"]) > 600:
-            app_state["log_history"].pop(0)
-    for q in list(log_subscribers):
-        try:
-            q(entry)
-        except Exception:
-            if q in log_subscribers:
-                log_subscribers.remove(q)
 
-def inspect_playlist_items(url: str) -> Dict[str, Any]:
-    """Inspects playlist and returns video list with indices, durations, and sync status."""
-    cmd = get_ytdlp_base_cmd() + [
+# ─── Playlist Inspector ────────────────────────────────────────────────────────
+
+def inspect_playlist(url: str) -> Dict[str, Any]:
+    """Returns items list with sync status. Timeout 60s for large playlists."""
+    cmd = get_ytdlp_cmd() + [
         "--flat-playlist",
         "--ignore-errors",
+        "--socket-timeout", "15",
         "--print", "%(playlist_index,autonumber)s\t%(id)s\t%(title)s\t%(duration_string)s",
-        url
+        url,
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=18)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if proc.returncode != 0 and not proc.stdout.strip():
-            return {"error": proc.stderr.strip() or f"yt-dlp exited with code {proc.returncode}"}
+            return {"error": proc.stderr.strip() or f"yt-dlp exited {proc.returncode}"}
 
-        archive_set = get_archive_set()
-        items = []
-        synced_count = 0
-
+        archive = get_archive_set()
+        items, synced = [], 0
         for line in proc.stdout.splitlines():
             line = line.strip()
             if not line:
                 continue
             parts = line.split("\t")
-            if len(parts) >= 3:
-                idx_str = parts[0]
-                try:
-                    idx = int(idx_str)
-                except ValueError:
-                    idx = len(items) + 1
-                vid_id = parts[1]
-                title = parts[2]
-                duration = parts[3] if len(parts) > 3 and parts[3] != "NA" else ""
-                is_downloaded = vid_id in archive_set
-                if is_downloaded:
-                    synced_count += 1
-
-                items.append({
-                    "index": idx,
-                    "id": vid_id,
-                    "title": title,
-                    "duration": duration,
-                    "is_downloaded": is_downloaded
-                })
+            if len(parts) < 3:
+                continue
+            try:
+                idx = int(parts[0])
+            except ValueError:
+                idx = len(items) + 1
+            vid_id   = parts[1]
+            title    = parts[2]
+            duration = parts[3] if len(parts) > 3 and parts[3] != "NA" else ""
+            downloaded = vid_id in archive
+            if downloaded:
+                synced += 1
+            items.append({"index": idx, "id": vid_id, "title": title,
+                           "duration": duration, "is_downloaded": downloaded})
 
         return {
-            "success": True,
-            "items": items,
-            "count": len(items),
-            "synced_count": synced_count,
-            "pending_count": len(items) - synced_count
+            "success":       True,
+            "items":         items,
+            "count":         len(items),
+            "synced_count":  synced,
+            "pending_count": len(items) - synced,
         }
     except subprocess.TimeoutExpired:
-        return {"error": "Timeout while inspecting playlist. Please check your internet connection."}
-    except Exception as e:
-        return {"error": f"Failed to inspect playlist: {str(e)}"}
+        return {"error": "Timeout inspecting playlist. Try a smaller playlist or check connection."}
+    except Exception as exc:
+        return {"error": f"Inspection failed: {exc}"}
 
-def update_active_progress(line: str):
-    with app_state["lock"]:
-        ad = app_state["active_download"]
-        # Match destination title
-        if "[download] Destination:" in line:
-            dest_file = line.split("[download] Destination:")[-1].strip()
-            title = Path(dest_file).stem
-            ad["title"] = title
-            ad["percent"] = 0.0
+
+# ─── Progress Parsing ──────────────────────────────────────────────────────────
+
+def _parse_progress(line: str):
+    """Update app_state active_download from a yt-dlp output line."""
+    ad = app_state["active_download"]
+    if "[download] Destination:" in line:
+        stem = Path(line.split("[download] Destination:")[-1].strip()).stem
+        ad["title"]   = stem
+        ad["percent"] = 0.0
+        ad["status"]  = "Downloading"
+    elif "[download]" in line and "%" in line:
+        m = re.search(r"(\d+\.?\d*)%\s+of\s+~?(\S+)\s+at\s+(\S+)\s+ETA\s+(\S+)", line)
+        if m:
+            try:
+                ad["percent"] = float(m.group(1))
+            except ValueError:
+                pass
+            ad["size"]   = m.group(2)
+            ad["speed"]  = m.group(3)
+            ad["eta"]    = m.group(4)
             ad["status"] = "Downloading"
-        # Match progress line: [download]  45.2% of 3.26MiB at 5.87MiB/s ETA 00:01
-        elif "[download]" in line and "%" in line:
-            m = re.search(r"(\d+\.?\d*)%\s+of\s+~?(\S+)\s+at\s+(\S+)\s+ETA\s+(\S+)", line)
-            if m:
-                try:
-                    ad["percent"] = float(m.group(1))
-                except ValueError:
-                    pass
-                ad["size"] = m.group(2)
-                ad["speed"] = m.group(3)
-                ad["eta"] = m.group(4)
-                ad["status"] = "Downloading"
-        elif "[ExtractAudio]" in line:
-            ad["status"] = "Extracting MP3"
-            ad["percent"] = 90.0
-        elif "[Metadata]" in line:
-            ad["status"] = "Adding Metadata"
-            ad["percent"] = 95.0
-        elif "[EmbedThumbnail]" in line or "[ThumbnailsConvertor]" in line:
-            ad["status"] = "Embedding Cover Art"
-            ad["percent"] = 98.0
+    elif "[ExtractAudio]" in line:
+        ad["status"] = "Extracting Audio"
+        ad["percent"] = 90.0
+    elif "[Metadata]" in line or "[FFmpegMetadata]" in line:
+        ad["status"] = "Adding Metadata"
+        ad["percent"] = 95.0
+    elif "[EmbedThumbnail]" in line or "[ThumbnailsConvertor]" in line:
+        ad["status"] = "Embedding Cover Art"
+        ad["percent"] = 98.0
+
+
+# ─── Download Job ──────────────────────────────────────────────────────────────
 
 def run_download_job(
     url: str,
@@ -300,38 +302,44 @@ def run_download_job(
     output_path: str,
     playlist_start: int = 1,
     playlist_end: Optional[int] = None,
-    force_redownload: bool = False
+    force_redownload: bool = False,
+    is_single_video: bool = False,
 ):
     ensure_config()
-    out_dir = Path(output_path).expanduser() if output_path else (DEFAULT_MUSIC_DIR if mode == "audio" else DEFAULT_VIDEO_DIR)
+    out_dir = (
+        Path(output_path).expanduser()
+        if output_path
+        else (DEFAULT_MUSIC_DIR if mode == "audio" else DEFAULT_VIDEO_DIR)
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    cmd = get_ytdlp_base_cmd() + [
-        "--yes-playlist",
+    cmd = get_ytdlp_cmd() + [
         "--ignore-errors",
         "--newline",
         "--add-metadata",
         "--embed-metadata",
+        "--socket-timeout", "30",
     ] + get_ffmpeg_args()
+
+    if is_single_video:
+        # Single video: no playlist flags
+        cmd.append("--no-playlist")
+    else:
+        cmd.append("--yes-playlist")
+        # Range
+        if playlist_start > 1 or playlist_end:
+            sv = max(1, playlist_start)
+            if playlist_end and playlist_end >= sv:
+                cmd.extend(["--playlist-items", f"{sv}:{playlist_end}"])
+            else:
+                cmd.extend(["--playlist-start", str(sv)])
 
     if force_redownload:
         cmd.extend(["--no-download-archive", "--force-overwrites"])
-        force_text = " (Force Re-download ON - downloading anyway)"
+        force_label = " (Force Re-download ON)"
     else:
         cmd.extend(["--download-archive", str(ARCHIVE_FILE), "--no-post-overwrites"])
-        force_text = ""
-
-    # Handle playlist start / end range
-    if playlist_start > 1 or playlist_end:
-        start_val = playlist_start if playlist_start >= 1 else 1
-        if playlist_end and playlist_end >= start_val:
-            cmd.extend(["--playlist-items", f"{start_val}:{playlist_end}"])
-            range_desc = f"Items #{start_val} to #{playlist_end}"
-        else:
-            cmd.extend(["--playlist-start", str(start_val)])
-            range_desc = f"Starting from Item #{start_val} (Skipping #{1} to #{start_val-1})"
-    else:
-        range_desc = "All items"
+        force_label = ""
 
     if mode == "audio":
         cmd.extend([
@@ -339,29 +347,30 @@ def run_download_job(
             "--audio-format", audio_fmt or "mp3",
             "--audio-quality", "0",
             "--embed-thumbnail",
-            "-o", str(out_dir / "%(title)s.%(ext)s")
+            "-o", str(out_dir / "%(title)s.%(ext)s"),
         ])
     else:
         cmd.extend([
             "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "--embed-thumbnail",
-            "-o", str(out_dir / "%(title)s [%(id)s].%(ext)s")
+            "-o", str(out_dir / "%(title)s [%(id)s].%(ext)s"),
         ])
 
     cmd.append(url)
 
-    broadcast_log(f"🔗 Starting download: {url}", "header")
-    broadcast_log(f"📁 Destination: {out_dir} | Mode: {mode.upper()} | Range: {range_desc}{force_text}", "header")
+    range_desc = "Single video" if is_single_video else (
+        f"Items #{max(1, playlist_start)} to #{playlist_end}" if playlist_end
+        else (f"From #{max(1, playlist_start)}" if playlist_start > 1 else "All items")
+    )
+
+    broadcast_log(f"🔗 URL: {url}", "header")
+    broadcast_log(f"📁 Dest: {out_dir} | Mode: {mode.upper()} | {range_desc}{force_label}", "header")
     broadcast_log("⏳ Contacting YouTube...", "info")
 
     with app_state["lock"]:
         app_state["active_download"] = {
-            "title": "Contacting YouTube...",
-            "percent": 0.0,
-            "speed": "--",
-            "eta": "--",
-            "size": "--",
-            "status": "Connecting"
+            "title": "Contacting YouTube...", "percent": 0.0,
+            "speed": "--", "eta": "--", "size": "--", "status": "Connecting",
         }
 
     try:
@@ -371,661 +380,225 @@ def run_download_job(
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
-            universal_newlines=True
         )
         with app_state["lock"]:
-            app_state["current_process"] = proc
-            app_state["is_downloading"] = True
-            app_state["current_task_name"] = url
+            app_state["current_process"]  = proc
+            app_state["is_downloading"]   = True
+            app_state["current_task_url"] = url
 
-        for line in iter(proc.stdout.readline, ''):
-            clean_line = line.strip()
-            if clean_line:
-                update_active_progress(clean_line)
-                if "has already been recorded in the archive" in clean_line:
-                    broadcast_log(f"⏩ [Already Downloaded] {clean_line}", "skip")
-                elif "[download]" in clean_line and "%" in clean_line:
-                    broadcast_log(clean_line, "progress")
-                elif "[download] Destination:" in clean_line:
-                    broadcast_log(f"📥 {clean_line}", "download")
-                elif "[ExtractAudio]" in clean_line or "[Metadata]" in clean_line or "[Thumbnails]" in clean_line or "[EmbedThumbnail]" in clean_line:
-                    broadcast_log(f"🎵 {clean_line}", "audio")
-                elif "ERROR" in clean_line:
-                    broadcast_log(f"❌ {clean_line}", "error")
-                elif "WARNING" in clean_line:
-                    broadcast_log(f"⚠️ {clean_line}", "warning")
-                else:
-                    broadcast_log(clean_line, "info")
+        for raw_line in iter(proc.stdout.readline, ""):
+            line = raw_line.strip()
+            if not line:
+                continue
+            with app_state["lock"]:
+                _parse_progress(line)
+
+            if "has already been recorded in the archive" in line:
+                broadcast_log(f"⏩ {line}", "skip")
+            elif "[download]" in line and "%" in line:
+                broadcast_log(line, "progress")
+            elif "[download] Destination:" in line:
+                broadcast_log(f"📥 {line}", "download")
+            elif any(t in line for t in ("[ExtractAudio]", "[Metadata]", "[FFmpegMetadata]",
+                                          "[EmbedThumbnail]", "[ThumbnailsConvertor]")):
+                broadcast_log(f"🎵 {line}", "audio")
+            elif "ERROR" in line:
+                broadcast_log(f"❌ {line}", "error")
+            elif "WARNING" in line:
+                broadcast_log(f"⚠️ {line}", "warning")
+            else:
+                broadcast_log(line, "info")
 
         proc.stdout.close()
         proc.wait()
 
         if proc.returncode == 0:
-            broadcast_log("✅ Sync completed successfully! All new tracks are ready in your synced folder.", "success")
+            broadcast_log("✅ Download complete! All new tracks are ready.", "success")
             with app_state["lock"]:
                 app_state["active_download"]["percent"] = 100.0
-                app_state["active_download"]["status"] = "Completed"
-        elif proc.returncode in (-15, -9):
-            broadcast_log("⚠️ Download was stopped by user.", "warning")
+                app_state["active_download"]["status"]  = "Completed"
+        elif proc.returncode in (-15, -9, 1):
+            broadcast_log("⚠️ Download stopped by user.", "warning")
             with app_state["lock"]:
                 app_state["active_download"]["status"] = "Stopped"
         else:
-            broadcast_log(f"⚠️ Process finished with exit code {proc.returncode}", "warning")
+            broadcast_log(f"⚠️ Process exited with code {proc.returncode}", "warning")
             with app_state["lock"]:
-                app_state["active_download"]["status"] = f"Finished ({proc.returncode})"
+                app_state["active_download"]["status"] = f"Exited ({proc.returncode})"
 
-    except Exception as e:
-        broadcast_log(f"❌ Error during execution: {str(e)}", "error")
+    except Exception as exc:
+        broadcast_log(f"❌ Execution error: {exc}", "error")
         with app_state["lock"]:
             app_state["active_download"]["status"] = "Error"
     finally:
         with app_state["lock"]:
-            app_state["current_process"] = None
-            app_state["is_downloading"] = False
-            app_state["current_task_name"] = ""
+            app_state["current_process"]  = None
+            app_state["is_downloading"]   = False
+            app_state["current_task_url"] = ""
+
 
 def run_sync_all_job():
     playlists = get_saved_playlists()
     if not playlists:
         broadcast_log("No saved playlists to sync. Add a playlist first!", "warning")
         return
-
-    broadcast_log(f"🚀 Starting Auto-Sync for {len(playlists)} saved playlist(s)...", "header")
-    for idx, p in enumerate(playlists, 1):
-        broadcast_log(f"\n--- [ Playlist {idx}/{len(playlists)}: {p['name']} ] ---", "header")
-        mode = p.get("mode", "audio")
+    broadcast_log(f"🚀 Syncing {len(playlists)} playlist(s)...", "header")
+    for i, p in enumerate(playlists, 1):
+        broadcast_log(f"\n─── Playlist {i}/{len(playlists)}: {p['name']} ───", "header")
+        mode      = p.get("mode", "audio")
         subfolder = p.get("subfolder", "").strip()
-        base_dir = DEFAULT_MUSIC_DIR if mode == "audio" else DEFAULT_VIDEO_DIR
-        out_dir = base_dir / subfolder if subfolder else base_dir
+        base      = DEFAULT_MUSIC_DIR if mode == "audio" else DEFAULT_VIDEO_DIR
+        out_dir   = base / subfolder if subfolder else base
         run_download_job(p["url"], mode, "mp3", str(out_dir), force_redownload=False)
     broadcast_log("\n✨ All playlists synced!", "success")
 
-# Single Page App Template with Now-Downloading Widget, Sync Badges & Force Re-download
-HTML_PAGE = f"""<!DOCTYPE html>
+
+# ─── HTML / CSS / JS ───────────────────────────────────────────────────────────
+
+_HTML = """\
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>YouTube Sync & Downloader</title>
+<title>YouTube Sync &amp; Downloader</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
-:root {{
-  --bg-dark: #090d16;
-  --bg-card: rgba(18, 26, 44, 0.75);
-  --bg-card-hover: rgba(26, 37, 63, 0.9);
-  --border: rgba(255, 255, 255, 0.08);
-  --border-focus: rgba(99, 102, 241, 0.5);
-  --primary: #6366f1;
-  --primary-glow: rgba(99, 102, 241, 0.35);
-  --accent: #06b6d4;
-  --success: #10b981;
-  --warning: #f59e0b;
-  --danger: #ef4444;
-  --text-main: #f8fafc;
-  --text-muted: #94a3b8;
-  --radius: 16px;
-}}
+:root {
+  --bg:          #090d16;
+  --card:        rgba(18,26,44,.75);
+  --card-h:      rgba(26,37,63,.9);
+  --border:      rgba(255,255,255,.08);
+  --focus:       rgba(99,102,241,.5);
+  --primary:     #6366f1;
+  --glow:        rgba(99,102,241,.35);
+  --accent:      #06b6d4;
+  --success:     #10b981;
+  --warning:     #f59e0b;
+  --danger:      #ef4444;
+  --text:        #f8fafc;
+  --muted:       #94a3b8;
+  --radius:      16px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Plus Jakarta Sans',sans-serif;background:var(--bg);background-image:radial-gradient(at 0% 0%,rgba(99,102,241,.14) 0,transparent 50%),radial-gradient(at 100% 100%,rgba(6,182,212,.12) 0,transparent 50%);color:var(--text);min-height:100vh;display:flex;flex-direction:column;overflow-x:hidden}
 
-* {{ box-sizing: border-box; margin: 0; padding: 0; }}
-body {{
-  font-family: 'Plus Jakarta Sans', sans-serif;
-  background-color: var(--bg-dark);
-  background-image: 
-    radial-gradient(at 0% 0%, rgba(99, 102, 241, 0.14) 0px, transparent 50%),
-    radial-gradient(at 100% 100%, rgba(6, 182, 212, 0.12) 0px, transparent 50%);
-  color: var(--text-main);
-  min-height: 100vh;
-  display: flex;
-  flex-direction: column;
-  overflow-x: hidden;
-}}
-
-/* Toast Container */
-#toastContainer {{
-  position: fixed;
-  top: 20px;
-  right: 20px;
-  z-index: 9999;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  max-width: 420px;
-  pointer-events: none;
-}}
-.toast {{
-  pointer-events: auto;
-  background: rgba(15, 23, 42, 0.95);
-  backdrop-filter: blur(16px);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 12px 16px;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
-  animation: toastSlideIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-  transition: all 0.2s ease;
-}}
-.toast.toast-success {{ border-left: 4px solid var(--success); }}
-.toast.toast-error {{ border-left: 4px solid var(--danger); }}
-.toast.toast-warning {{ border-left: 4px solid var(--warning); }}
-.toast.toast-info {{ border-left: 4px solid var(--accent); }}
-.toast-icon {{ font-size: 1.2rem; display: flex; align-items: center; justify-content: center; }}
-.toast-content {{ flex: 1; }}
-.toast-title {{ font-size: 0.85rem; font-weight: 700; color: var(--text-main); }}
-.toast-desc {{ font-size: 0.78rem; color: var(--text-muted); margin-top: 2px; }}
-.toast-close {{
-  background: transparent;
-  border: none;
-  color: var(--text-muted);
-  cursor: pointer;
-  padding: 4px;
-  font-size: 1rem;
-}}
-.toast-close:hover {{ color: var(--text-main); }}
-
-@keyframes toastSlideIn {{
-  from {{ transform: translateX(100%); opacity: 0; }}
-  to {{ transform: translateX(0); opacity: 1; }}
-}}
-@keyframes toastFadeOut {{
-  from {{ transform: translateX(0); opacity: 1; }}
-  to {{ transform: translateX(100%); opacity: 0; }}
-}}
+/* Toast */
+#toastBox{position:fixed;top:20px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:10px;max-width:420px;pointer-events:none}
+.toast{pointer-events:auto;background:rgba(15,23,42,.96);backdrop-filter:blur(16px);border:1px solid var(--border);border-radius:12px;padding:12px 16px;display:flex;align-items:center;gap:12px;box-shadow:0 10px 30px rgba(0,0,0,.5);animation:tsIn .3s cubic-bezier(.16,1,.3,1) forwards}
+.toast.ts-success{border-left:4px solid var(--success)}.toast.ts-error{border-left:4px solid var(--danger)}.toast.ts-warning{border-left:4px solid var(--warning)}.toast.ts-info{border-left:4px solid var(--accent)}
+.t-icon{font-size:1.2rem}.t-body{flex:1}.t-title{font-size:.85rem;font-weight:700}.t-desc{font-size:.78rem;color:var(--muted);margin-top:2px}
+.t-close{background:none;border:none;color:var(--muted);cursor:pointer;padding:4px;font-size:1rem}
+.t-close:hover{color:var(--text)}
+@keyframes tsIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}
+@keyframes tsOut{from{transform:translateX(0);opacity:1}to{transform:translateX(100%);opacity:0}}
 
 /* Header */
-header {{
-  padding: 1.15rem 2rem;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  border-bottom: 1px solid var(--border);
-  background: rgba(9, 13, 22, 0.85);
-  backdrop-filter: blur(12px);
-  position: sticky;
-  top: 0;
-  z-index: 100;
-}}
-.logo-container {{
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}}
-.logo-icon {{
-  width: 40px;
-  height: 40px;
-  background: linear-gradient(135deg, #ef4444, #6366f1);
-  border-radius: 12px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  box-shadow: 0 4px 16px rgba(239, 68, 68, 0.35);
-}}
-.logo-icon svg {{ width: 22px; height: 22px; fill: white; }}
-.logo-text h1 {{ font-size: 1.2rem; font-weight: 800; letter-spacing: -0.5px; }}
-.logo-text span {{ font-size: 0.72rem; color: var(--accent); font-weight: 700; text-transform: uppercase; letter-spacing: 1px; }}
-
-.header-actions {{
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}}
-.badge-archive {{
-  padding: 6px 14px;
-  border-radius: 30px;
-  background: rgba(16, 185, 129, 0.15);
-  border: 1px solid rgba(16, 185, 129, 0.3);
-  color: var(--success);
-  font-size: 0.8rem;
-  font-weight: 600;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}}
-.btn-shutdown {{
-  background: rgba(239, 68, 68, 0.12);
-  border: 1px solid rgba(239, 68, 68, 0.3);
-  color: #fca5a5;
-  padding: 8px 14px;
-  border-radius: 10px;
-  cursor: pointer;
-  font-weight: 600;
-  font-size: 0.85rem;
-  transition: all 0.2s;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}}
-.btn-shutdown:hover {{
-  background: var(--danger);
-  color: white;
-}}
+header{padding:1.15rem 2rem;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border);background:rgba(9,13,22,.85);backdrop-filter:blur(12px);position:sticky;top:0;z-index:100}
+.logo{display:flex;align-items:center;gap:12px}
+.logo-icon{width:40px;height:40px;background:linear-gradient(135deg,#ef4444,#6366f1);border-radius:12px;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(239,68,68,.35)}
+.logo-icon svg{width:22px;height:22px;fill:#fff}
+.logo-text h1{font-size:1.2rem;font-weight:800;letter-spacing:-.5px}
+.logo-text span{font-size:.72rem;color:var(--accent);font-weight:700;text-transform:uppercase;letter-spacing:1px}
+.hdr-right{display:flex;align-items:center;gap:12px}
+.badge-arc{padding:6px 14px;border-radius:30px;background:rgba(16,185,129,.15);border:1px solid rgba(16,185,129,.3);color:var(--success);font-size:.8rem;font-weight:600;display:flex;align-items:center;gap:6px}
+.btn-exit{background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.3);color:#fca5a5;padding:8px 14px;border-radius:10px;cursor:pointer;font-weight:600;font-size:.85rem;transition:all .2s;display:flex;align-items:center;gap:6px}
+.btn-exit:hover{background:var(--danger);color:#fff}
 
 /* Layout */
-main {{
-  flex: 1;
-  padding: 1.75rem 2rem;
-  max-width: 1300px;
-  width: 100%;
-  margin: 0 auto;
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 1.75rem;
-}}
+main{flex:1;padding:1.75rem 2rem;max-width:1320px;width:100%;margin:0 auto;display:grid;grid-template-columns:1fr 1fr;gap:1.75rem}
+@media(max-width:960px){main{grid-template-columns:1fr}}
 
-@media (max-width: 950px) {{
-  main {{ grid-template-columns: 1fr; }}
-}}
-
-/* Cards */
-.card {{
-  background: var(--bg-card);
-  backdrop-filter: blur(16px);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 1.5rem;
-  box-shadow: 0 8px 32px rgba(0,0,0,0.35);
-  display: flex;
-  flex-direction: column;
-}}
-.card-header {{
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 1.25rem;
-}}
-.card-title {{
-  font-size: 1.1rem;
-  font-weight: 700;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}}
+/* Card */
+.card{background:var(--card);backdrop-filter:blur(16px);border:1px solid var(--border);border-radius:var(--radius);padding:1.5rem;box-shadow:0 8px 32px rgba(0,0,0,.35);display:flex;flex-direction:column}
+.card-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:1.25rem}
+.card-title{font-size:1.1rem;font-weight:700;display:flex;align-items:center;gap:10px}
 
 /* Forms */
-.form-group {{
-  margin-bottom: 1.15rem;
-}}
-label {{
-  display: block;
-  font-size: 0.8rem;
-  font-weight: 600;
-  color: var(--text-muted);
-  margin-bottom: 6px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-}}
-input[type="text"], input[type="number"], select {{
-  width: 100%;
-  padding: 11px 14px;
-  background: rgba(10, 15, 29, 0.85);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  color: var(--text-main);
-  font-family: inherit;
-  font-size: 0.92rem;
-  transition: all 0.2s;
-  outline: none;
-}}
-input[type="text"]:focus, input[type="number"]:focus, select:focus {{
-  border-color: var(--primary);
-  box-shadow: 0 0 0 3px var(--primary-glow);
-}}
-.row {{ display: flex; gap: 10px; }}
-.row .form-group {{ flex: 1; }}
+.fg{margin-bottom:1.15rem}
+label{display:block;font-size:.8rem;font-weight:600;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px}
+input[type=text],input[type=number],select{width:100%;padding:11px 14px;background:rgba(10,15,29,.85);border:1px solid var(--border);border-radius:12px;color:var(--text);font-family:inherit;font-size:.92rem;transition:all .2s;outline:none}
+input[type=text]:focus,input[type=number]:focus,select:focus{border-color:var(--primary);box-shadow:0 0 0 3px var(--glow)}
+select option{background:#0f172a}
+.row{display:flex;gap:10px}.row .fg{flex:1}
 
-.btn {{
-  padding: 11px 18px;
-  border-radius: 12px;
-  font-weight: 700;
-  font-size: 0.92rem;
-  font-family: inherit;
-  cursor: pointer;
-  border: none;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  transition: all 0.2s;
-}}
-.btn-primary {{
-  background: linear-gradient(135deg, var(--primary), #4f46e5);
-  color: white;
-  box-shadow: 0 4px 20px var(--primary-glow);
-}}
-.btn-primary:hover {{
-  transform: translateY(-1px);
-  box-shadow: 0 6px 24px var(--primary-glow);
-}}
-.btn-primary:disabled {{
-  opacity: 0.6;
-  cursor: not-allowed;
-  transform: none;
-}}
-.btn-secondary {{
-  background: rgba(255, 255, 255, 0.06);
-  color: var(--text-main);
-  border: 1px solid var(--border);
-}}
-.btn-secondary:hover {{
-  background: rgba(255, 255, 255, 0.12);
-  border-color: rgba(255, 255, 255, 0.2);
-}}
-.btn-danger {{
-  background: rgba(239, 68, 68, 0.15);
-  color: #fca5a5;
-  border: 1px solid rgba(239, 68, 68, 0.3);
-}}
-.btn-danger:hover {{
-  background: var(--danger);
-  color: white;
-}}
+/* Buttons */
+.btn{padding:11px 18px;border-radius:12px;font-weight:700;font-size:.92rem;font-family:inherit;cursor:pointer;border:none;display:inline-flex;align-items:center;justify-content:center;gap:8px;transition:all .2s}
+.btn-primary{background:linear-gradient(135deg,var(--primary),#4f46e5);color:#fff;box-shadow:0 4px 20px var(--glow)}
+.btn-primary:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 6px 24px var(--glow)}
+.btn-primary:disabled{opacity:.6;cursor:not-allowed;transform:none}
+.btn-secondary{background:rgba(255,255,255,.06);color:var(--text);border:1px solid var(--border)}
+.btn-secondary:hover:not(:disabled){background:rgba(255,255,255,.12);border-color:rgba(255,255,255,.2)}
+.btn-secondary:disabled{opacity:.5;cursor:not-allowed}
+.btn-danger{background:rgba(239,68,68,.15);color:#fca5a5;border:1px solid rgba(239,68,68,.3)}
+.btn-danger:hover:not(:disabled){background:var(--danger);color:#fff}
+.btn-sm{padding:8px 14px;font-size:.82rem;border-radius:10px}
 
-/* Quick chips */
-.quick-chip {{
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid var(--border);
-  color: var(--text-muted);
-  font-size: 0.75rem;
-  font-weight: 600;
-  padding: 4px 10px;
-  border-radius: 20px;
-  cursor: pointer;
-  transition: all 0.2s;
-  font-family: inherit;
-}}
-.quick-chip:hover {{
-  background: rgba(99, 102, 241, 0.2);
-  color: #c7d2fe;
-  border-color: var(--primary);
-}}
+/* Chips */
+.chip{background:rgba(255,255,255,.05);border:1px solid var(--border);color:var(--muted);font-size:.75rem;font-weight:600;padding:4px 10px;border-radius:20px;cursor:pointer;transition:all .2s;font-family:inherit;white-space:nowrap}
+.chip:hover{background:rgba(99,102,241,.2);color:#c7d2fe;border-color:var(--primary)}
 
-/* Playlist Inspector Panel */
-.inspector-panel {{
-  background: rgba(10, 15, 29, 0.85);
-  border: 1px solid rgba(99, 102, 241, 0.35);
-  border-radius: 12px;
-  padding: 14px 16px;
-  margin-bottom: 1.15rem;
-  display: none;
-  flex-direction: column;
-  gap: 10px;
-  animation: fadeIn 0.25s ease;
-}}
-@keyframes fadeIn {{ from {{ opacity: 0; transform: translateY(-6px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+/* Checkbox */
+.chk-label{display:flex;align-items:center;gap:8px;cursor:pointer;font-size:.82rem;color:#cbd5e1;text-transform:none;letter-spacing:normal;margin-bottom:0}
+.chk-label input[type=checkbox]{width:16px;height:16px;accent-color:var(--warning);cursor:pointer}
 
-.inspector-header {{
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}}
-.inspect-stats {{
-  display: flex;
-  gap: 8px;
-  font-size: 0.78rem;
-  font-weight: 700;
-}}
-.badge-stat-synced {{
-  color: var(--success);
-  background: rgba(16, 185, 129, 0.15);
-  padding: 3px 8px;
-  border-radius: 12px;
-  border: 1px solid rgba(16, 185, 129, 0.3);
-}}
-.badge-stat-pending {{
-  color: var(--accent);
-  background: rgba(6, 182, 212, 0.15);
-  padding: 3px 8px;
-  border-radius: 12px;
-  border: 1px solid rgba(6, 182, 212, 0.3);
-}}
+/* Inspector panel */
+.inspector{background:rgba(10,15,29,.85);border:1px solid rgba(99,102,241,.35);border-radius:12px;padding:14px 16px;margin-bottom:1.15rem;display:none;flex-direction:column;gap:10px;animation:fade .25s ease}
+@keyframes fade{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}
+.ins-hdr{display:flex;justify-content:space-between;align-items:center}
+.ins-stats{display:flex;gap:8px;font-size:.78rem;font-weight:700}
+.bs{padding:3px 8px;border-radius:12px;border:1px solid;display:inline-flex;align-items:center;gap:3px;font-size:.7rem;font-weight:700}
+.bs-syn{background:rgba(16,185,129,.15);color:var(--success);border-color:rgba(16,185,129,.3)}
+.bs-pend{background:rgba(6,182,212,.15);color:var(--accent);border-color:rgba(6,182,212,.3)}
+.ins-list{max-height:230px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;padding-right:4px}
+.ins-row{background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:8px;padding:8px 10px;display:flex;align-items:center;justify-content:space-between;font-size:.8rem;gap:8px;transition:all .15s}
+.ins-row:hover{background:rgba(99,102,241,.12);border-color:rgba(99,102,241,.4)}
+.ins-row.syn{border-left:3px solid var(--success)}.ins-row.pend{border-left:3px solid var(--accent)}
+.pb-syn{background:rgba(16,185,129,.15);color:var(--success)}.pb-pend{background:rgba(6,182,212,.15);color:var(--accent)}
+.pb-dl{background:rgba(99,102,241,.2);border:1px solid var(--primary);color:#c7d2fe;padding:3px 8px;border-radius:6px;font-size:.72rem;cursor:pointer;font-weight:600;transition:all .15s;white-space:nowrap}
+.pb-dl:hover{background:var(--primary);color:#fff}
+.pb-redl{background:rgba(245,158,11,.15);border:1px solid rgba(245,158,11,.4);color:#fde68a;padding:3px 8px;border-radius:6px;font-size:.72rem;cursor:pointer;font-weight:600;transition:all .15s;white-space:nowrap}
+.pb-redl:hover{background:var(--warning);color:#000}
 
-.inspector-items-list {{
-  max-height: 220px;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding-right: 4px;
-}}
-.inspect-row {{
-  background: rgba(255, 255, 255, 0.03);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 8px 10px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  font-size: 0.8rem;
-  gap: 8px;
-  transition: all 0.15s;
-}}
-.inspect-row:hover {{ background: rgba(99, 102, 241, 0.12); border-color: rgba(99, 102, 241, 0.4); }}
-.inspect-row.synced-item {{ border-left: 3px solid var(--success); }}
-.inspect-row.pending-item {{ border-left: 3px solid var(--accent); }}
+/* Now-downloading widget */
+.nd-card{background:rgba(15,23,42,.9);border:1px solid rgba(99,102,241,.35);border-radius:12px;padding:12px 16px;margin-bottom:1rem;display:none;flex-direction:column;gap:8px}
+.nd-hdr{display:flex;justify-content:space-between;align-items:center}
+.nd-title{font-weight:700;font-size:.88rem;color:#c7d2fe;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:75%}
+.nd-pill{padding:3px 8px;border-radius:12px;font-size:.72rem;font-weight:700;background:rgba(99,102,241,.25);color:#a5b4fc;border:1px solid rgba(99,102,241,.4)}
+.pb-bg{height:8px;width:100%;background:rgba(255,255,255,.08);border-radius:6px;overflow:hidden}
+.pb-fill{height:100%;width:0%;background:linear-gradient(90deg,#6366f1,#06b6d4,#10b981);border-radius:6px;transition:width .3s ease}
+.nd-meta{display:flex;justify-content:space-between;font-size:.75rem;color:var(--muted);font-family:'JetBrains Mono',monospace}
 
-.badge-synced-pill {{
-  background: rgba(16, 185, 129, 0.15);
-  color: var(--success);
-  font-size: 0.7rem;
-  font-weight: 700;
-  padding: 2px 6px;
-  border-radius: 6px;
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-}}
-.badge-pending-pill {{
-  background: rgba(6, 182, 212, 0.15);
-  color: var(--accent);
-  font-size: 0.7rem;
-  font-weight: 700;
-  padding: 2px 6px;
-  border-radius: 6px;
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-}}
+/* Saved playlists */
+.pl-list{display:flex;flex-direction:column;gap:10px;max-height:260px;overflow-y:auto;padding-right:4px}
+.pl-item{background:rgba(10,15,29,.65);border:1px solid var(--border);border-radius:12px;padding:12px 14px;display:flex;justify-content:space-between;align-items:center;transition:all .2s}
+.pl-item:hover{background:var(--card-h);border-color:rgba(99,102,241,.3)}
+.pl-info h4{font-size:.92rem;font-weight:700}.pl-info p{font-size:.76rem;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:240px}
+.pl-btns{display:flex;gap:8px;flex-shrink:0}
 
-.badge-start-btn {{
-  background: rgba(99, 102, 241, 0.2);
-  border: 1px solid var(--primary);
-  color: #c7d2fe;
-  padding: 3px 8px;
-  border-radius: 6px;
-  font-size: 0.72rem;
-  cursor: pointer;
-  font-weight: 600;
-  transition: all 0.15s;
-  white-space: nowrap;
-}}
-.badge-start-btn:hover {{ background: var(--primary); color: white; }}
-
-.badge-redownload-btn {{
-  background: rgba(245, 158, 11, 0.15);
-  border: 1px solid rgba(245, 158, 11, 0.4);
-  color: #fde68a;
-  padding: 3px 8px;
-  border-radius: 6px;
-  font-size: 0.72rem;
-  cursor: pointer;
-  font-weight: 600;
-  transition: all 0.15s;
-  white-space: nowrap;
-}}
-.badge-redownload-btn:hover {{ background: var(--warning); color: black; }}
-
-/* Now Downloading Widget */
-.now-downloading-card {{
-  background: rgba(15, 23, 42, 0.9);
-  border: 1px solid rgba(99, 102, 241, 0.35);
-  border-radius: 12px;
-  padding: 12px 16px;
-  margin-bottom: 1rem;
-  display: none;
-  flex-direction: column;
-  gap: 8px;
-}}
-.nd-header {{
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}}
-.nd-title {{
-  font-weight: 700;
-  font-size: 0.88rem;
-  color: #c7d2fe;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 75%;
-}}
-.nd-stage-pill {{
-  padding: 3px 8px;
-  border-radius: 12px;
-  font-size: 0.72rem;
-  font-weight: 700;
-  background: rgba(99, 102, 241, 0.25);
-  color: #a5b4fc;
-  border: 1px solid rgba(99, 102, 241, 0.4);
-}}
-.progress-bar-bg {{
-  height: 8px;
-  width: 100%;
-  background: rgba(255, 255, 255, 0.08);
-  border-radius: 6px;
-  overflow: hidden;
-}}
-.progress-bar-fill {{
-  height: 100%;
-  width: 0%;
-  background: linear-gradient(90deg, #6366f1, #06b6d4, #10b981);
-  border-radius: 6px;
-  transition: width 0.3s ease;
-}}
-.nd-meta {{
-  display: flex;
-  justify-content: space-between;
-  font-size: 0.75rem;
-  color: var(--text-muted);
-  font-family: 'JetBrains Mono', monospace;
-}}
-
-/* Checkbox toggle */
-.checkbox-label {{
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  cursor: pointer;
-  font-size: 0.82rem;
-  color: #cbd5e1;
-  text-transform: none;
-  letter-spacing: normal;
-  margin-bottom: 0;
-}}
-.checkbox-label input[type="checkbox"] {{
-  width: 16px;
-  height: 16px;
-  accent-color: var(--warning);
-  cursor: pointer;
-}}
-
-/* Playlists Grid */
-.playlist-list {{
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  max-height: 250px;
-  overflow-y: auto;
-  padding-right: 4px;
-}}
-.playlist-item {{
-  background: rgba(10, 15, 29, 0.65);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 12px 14px;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  transition: all 0.2s;
-}}
-.playlist-item:hover {{
-  background: var(--bg-card-hover);
-  border-color: rgba(99, 102, 241, 0.3);
-}}
-.pl-info h4 {{ font-size: 0.92rem; font-weight: 700; }}
-.pl-info p {{ font-size: 0.76rem; color: var(--text-muted); margin-top: 2px; }}
-.pl-actions {{ display: flex; gap: 8px; }}
-
-/* Console / Log Viewer */
-.console-card {{
-  grid-column: 1 / -1;
-  min-height: 300px;
-}}
-.console-box {{
-  background: #050811;
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  border-radius: 12px;
-  padding: 1rem;
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 0.84rem;
-  height: 240px;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}}
-.log-line {{
-  line-height: 1.4;
-  word-break: break-all;
-}}
-.log-time {{ color: #64748b; margin-right: 8px; font-size: 0.76rem; }}
-.log-header {{ color: #818cf8; font-weight: 600; }}
-.log-skip {{ color: #38bdf8; }}
-.log-progress {{ color: #fbbf24; }}
-.log-download {{ color: #34d399; font-weight: 600; }}
-.log-audio {{ color: #a78bfa; }}
-.log-success {{ color: #4ade80; font-weight: 700; }}
-.log-error {{ color: #f87171; font-weight: 700; }}
-.log-warning {{ color: #fb923c; }}
-.log-info {{ color: #cbd5e1; }}
+/* Console */
+.con-card{grid-column:1/-1;min-height:300px}
+.con-box{background:#050811;border:1px solid rgba(255,255,255,.06);border-radius:12px;padding:1rem;font-family:'JetBrains Mono',monospace;font-size:.84rem;height:260px;overflow-y:auto;display:flex;flex-direction:column;gap:4px}
+.ll{line-height:1.4;word-break:break-all}
+.lt{color:#64748b;margin-right:8px;font-size:.76rem}
+.lh{color:#818cf8;font-weight:600}.lsk{color:#38bdf8}.lpr{color:#fbbf24}.ldl{color:#34d399;font-weight:600}.lau{color:#a78bfa}.lsu{color:#4ade80;font-weight:700}.ler{color:#f87171;font-weight:700}.lw{color:#fb923c}.li{color:#cbd5e1}
 
 /* Spinner */
-.spinner {{
-  display: inline-block;
-  width: 14px;
-  height: 14px;
-  border: 2px solid rgba(255,255,255,0.3);
-  border-radius: 50%;
-  border-top-color: white;
-  animation: spin 0.8s linear infinite;
-}}
-@keyframes spin {{
-  to {{ transform: rotate(360deg); }}
-}}
+.sp{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.3);border-radius:50%;border-top-color:#fff;animation:spin .8s linear infinite;vertical-align:middle}
+@keyframes spin{to{transform:rotate(360deg)}}
 
-.info-banner {{
-  background: rgba(99, 102, 241, 0.08);
-  border: 1px solid rgba(99, 102, 241, 0.2);
-  border-radius: 12px;
-  padding: 10px 14px;
-  font-size: 0.82rem;
-  color: #c7d2fe;
-  margin-top: 0.75rem;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}}
+/* Info banner */
+.info-banner{background:rgba(99,102,241,.08);border:1px solid rgba(99,102,241,.2);border-radius:12px;padding:10px 14px;font-size:.82rem;color:#c7d2fe;margin-top:.75rem;display:flex;align-items:center;gap:10px}
 </style>
 </head>
 <body>
 
-<div id="toastContainer"></div>
+<div id="toastBox"></div>
 
 <header>
-  <div class="logo-container">
+  <div class="logo">
     <div class="logo-icon">
       <svg viewBox="0 0 24 24"><path d="M19.615 3.184c-3.604-.246-11.631-.245-15.23 0-3.897.266-4.356 2.62-4.385 8.816.029 6.185.484 8.549 4.385 8.816 3.6.245 11.626.246 15.23 0 3.897-.266 4.356-2.62 4.385-8.816-.029-6.185-.484-8.549-4.385-8.816zm-10.615 12.816v-8l8 3.993-8 4.007z"/></svg>
     </div>
@@ -1034,12 +607,11 @@ input[type="text"]:focus, input[type="number"]:focus, select:focus {{
       <span>Incremental Downloader</span>
     </div>
   </div>
-
-  <div class="header-actions">
-    <div class="badge-archive" id="archiveBadge">
-      <span>●</span> <span id="archiveCount">0</span> downloaded items recorded
+  <div class="hdr-right">
+    <div class="badge-arc">
+      <span>●</span> <span id="arcCount">0</span> items archived
     </div>
-    <button class="btn-shutdown" onclick="shutdownApp()" id="btnShutdown" title="Close and shutdown application server">
+    <button class="btn-exit" onclick="shutdownApp()" id="btnExit">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18.36 6.64a9 9 0 1 1-12.73 0M12 2v10"/></svg>
       Exit App
     </button>
@@ -1047,931 +619,885 @@ input[type="text"]:focus, input[type="number"]:focus, select:focus {{
 </header>
 
 <main>
-  <!-- Card 1: Direct Download -->
+  <!-- ── Card 1: Direct Download ── -->
   <div class="card">
-    <div class="card-header">
-      <div class="card-title">
-        <span>⚡</span> Direct Playlist / Video Download
+    <div class="card-hdr">
+      <div class="card-title">⚡ Direct Download</div>
+    </div>
+
+    <div class="fg">
+      <label>YouTube Playlist or Video URL</label>
+      <div style="display:flex;gap:8px">
+        <input type="text" id="dlUrl" placeholder="https://www.youtube.com/playlist?list=..." />
+        <button type="button" class="btn btn-secondary btn-sm" onclick="inspectPlaylist()" id="btnInspect" style="white-space:nowrap">
+          🔍 Check Items
+        </button>
       </div>
     </div>
 
-    <form id="directForm" onsubmit="handleDirectDownload(event)">
-      <div class="form-group">
-        <label>YouTube Playlist or Video URL</label>
-        <div style="display: flex; gap: 8px;">
-          <input type="text" id="directUrl" placeholder="https://www.youtube.com/playlist?list=..." required />
-          <button type="button" class="btn btn-secondary" onclick="inspectPlaylist()" id="btnInspect" style="padding: 10px 14px; font-size: 0.85rem; white-space: nowrap;">
-            🔍 Check Items
-          </button>
+    <!-- Inspector panel -->
+    <div class="inspector" id="inspectorPanel">
+      <div class="ins-hdr">
+        <div class="ins-stats">
+          <span class="bs bs-syn" id="stSynced">🟢 0 Synced</span>
+          <span class="bs bs-pend" id="stPending">⚪ 0 Pending</span>
         </div>
+        <button type="button" class="chip" onclick="closeInspector()">✕ Hide</button>
       </div>
-
-      <!-- Playlist Video Range & Item Inspector Panel -->
-      <div class="inspector-panel" id="inspectorPanel">
-        <div class="inspector-header">
-          <div class="inspect-stats">
-            <span class="badge-stat-synced" id="statSynced">🟢 0 Synced</span>
-            <span class="badge-stat-pending" id="statPending">⚪ 0 Pending</span>
-          </div>
-          <button type="button" class="quick-chip" onclick="closeInspector()">✕ Hide</button>
-        </div>
-        
-        <div class="inspector-items-list" id="inspectItemsList">
-          <!-- Populated dynamically -->
-        </div>
-
-        <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-top: 4px;">
-          <div style="display: flex; align-items: center; gap: 6px; font-size: 0.8rem; color: var(--text-muted);">
-            <span>Range:</span>
-            <button type="button" class="quick-chip" onclick="setPlaylistRange(1, null)">From #1 (All)</button>
-            <button type="button" class="quick-chip" onclick="setPlaylistRange(4, null)">Skip First 3 (#4+)</button>
-          </div>
-        </div>
+      <div class="ins-list" id="insList"></div>
+      <div style="display:flex;align-items:center;gap:6px;font-size:.8rem;color:var(--muted)">
+        <span>Quick range:</span>
+        <button type="button" class="chip" onclick="setRange(1,null)">All from #1</button>
+        <button type="button" class="chip" onclick="setRange(2,null)">Skip #1</button>
+        <button type="button" class="chip" onclick="setRange(4,null)">Skip first 3</button>
       </div>
+    </div>
 
-      <!-- Start Video Index / Range -->
-      <div class="row">
-        <div class="form-group">
-          <label>Start from Video # (Skip earlier)</label>
-          <input type="number" id="directStart" min="1" value="1" placeholder="1" />
-        </div>
-        <div class="form-group">
-          <label>End Video # (Optional)</label>
-          <input type="number" id="directEnd" min="1" placeholder="End" />
-        </div>
+    <div class="row">
+      <div class="fg">
+        <label>Start from # (skip earlier)</label>
+        <input type="number" id="dlStart" min="1" value="1" />
       </div>
-
-      <div class="row">
-        <div class="form-group">
-          <label>Mode</label>
-          <select id="directMode" onchange="toggleFormatSelect()">
-            <option value="audio">Audio (Music for Phone)</option>
-            <option value="video">Video (MP4 High Res)</option>
-          </select>
-        </div>
-        <div class="form-group" id="formatGroup">
-          <label>Audio Format</label>
-          <select id="directFormat">
-            <option value="mp3">MP3 (Best Compatibility)</option>
-            <option value="m4a">M4A (AAC)</option>
-            <option value="opus">Opus</option>
-            <option value="flac">FLAC</option>
-          </select>
-        </div>
+      <div class="fg">
+        <label>End # (optional)</label>
+        <input type="number" id="dlEnd" min="1" placeholder="End" />
       </div>
+    </div>
 
-      <div class="form-group">
-        <label>Destination Folder</label>
-        <div style="display: flex; gap: 8px;">
-          <input type="text" id="directOutput" value="{DEFAULT_MUSIC_DIR}" placeholder="{DEFAULT_MUSIC_DIR}" style="flex: 1;" />
-          <button type="button" class="btn btn-secondary" onclick="browseFolder('directOutput')" id="btnBrowse" style="padding: 10px 14px; font-size: 0.85rem; white-space: nowrap;">
-            📁 Browse...
-          </button>
-        </div>
-        <div style="display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap;">
-          <button type="button" class="quick-chip" onclick="setQuickFolder('directOutput', '{DEFAULT_MUSIC_DIR}')">🎵 ~/phone (Syncthing)</button>
-          <button type="button" class="quick-chip" onclick="setQuickFolder('directOutput', '{DEFAULT_VIDEO_DIR}')">🎬 ~/Videos</button>
-          <button type="button" class="quick-chip" onclick="setQuickFolder('directOutput', '{DEFAULT_DOWNLOADS_DIR}')">📥 ~/Downloads</button>
-        </div>
+    <div class="row">
+      <div class="fg">
+        <label>Mode</label>
+        <select id="dlMode" onchange="onModeChange()">
+          <option value="audio">🎵 Audio (MP3 for music)</option>
+          <option value="video">🎬 Video (MP4 best quality)</option>
+        </select>
       </div>
-
-      <!-- Force Re-download Option -->
-      <div class="form-group" style="margin-bottom: 0.85rem;">
-        <label class="checkbox-label">
-          <input type="checkbox" id="directForce" />
-          <span>⚡ <strong>Download anyway</strong> (Force re-download even if already synced)</span>
-        </label>
+      <div class="fg" id="fmtGroup">
+        <label>Audio Format</label>
+        <select id="dlFormat">
+          <option value="mp3">MP3 (Best compatibility)</option>
+          <option value="m4a">M4A / AAC</option>
+          <option value="opus">Opus</option>
+          <option value="flac">FLAC (lossless)</option>
+        </select>
       </div>
+    </div>
 
-      <div style="display: flex; gap: 10px; margin-top: 0.5rem;">
-        <button type="submit" class="btn btn-primary" id="btnDownload" style="flex: 1;">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
-          <span id="btnDownloadText">Download / Sync Incremental</span>
-        </button>
-        <button type="button" class="btn btn-danger" id="btnStop" onclick="stopDownload()" style="display: none;">
-          Stop
+    <div class="fg">
+      <label>Destination Folder</label>
+      <div style="display:flex;gap:8px">
+        <input type="text" id="dlOutput" value="MUSIC_DIR_PLACEHOLDER" style="flex:1" />
+        <button type="button" class="btn btn-secondary btn-sm" onclick="browseFolder('dlOutput')" id="btnBrowse" style="white-space:nowrap">
+          📁 Browse...
         </button>
       </div>
-
-      <div class="info-banner">
-        <span>💡</span>
-        <span>By default, only <strong>new</strong> tracks are downloaded. Check <em>Download anyway</em> if you ever want to re-fetch existing tracks!</span>
+      <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+        <button type="button" class="chip" onclick="setFolder('dlOutput','MUSIC_DIR_PLACEHOLDER')">🎵 Music (phone)</button>
+        <button type="button" class="chip" onclick="setFolder('dlOutput','VIDEO_DIR_PLACEHOLDER')">🎬 Videos</button>
+        <button type="button" class="chip" onclick="setFolder('dlOutput','DL_DIR_PLACEHOLDER')">📥 Downloads</button>
       </div>
-    </form>
-  </div>
+    </div>
 
-  <!-- Card 2: Saved Playlists Manager -->
-  <div class="card">
-    <div class="card-header">
-      <div class="card-title">
-        <span>📑</span> Saved Auto-Sync Playlists
-      </div>
-      <button class="btn btn-primary" style="padding: 6px 12px; font-size: 0.82rem;" onclick="syncAllPlaylists()" id="btnSyncAll">
-        🔄 Sync All
+    <div class="fg" style="margin-bottom:.85rem">
+      <label class="chk-label">
+        <input type="checkbox" id="dlForce" />
+        <span>⚡ <strong>Download anyway</strong> — force re-download even if already synced</span>
+      </label>
+    </div>
+
+    <div style="display:flex;gap:10px;margin-top:.5rem">
+      <button type="button" class="btn btn-primary" id="btnDownload" onclick="startDownload()" style="flex:1">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
+        <span id="btnDlText">Download / Sync Incremental</span>
+      </button>
+      <button type="button" class="btn btn-danger" id="btnStop" onclick="stopDownload()" style="display:none">
+        ⏹ Stop
       </button>
     </div>
 
-    <div class="playlist-list" id="playlistContainer">
-      <p style="color: var(--text-muted); font-size: 0.88rem; text-align: center; padding: 2rem;">Loading saved playlists...</p>
+    <div class="info-banner">
+      <span>💡</span>
+      <span>Only <strong>new</strong> tracks are downloaded by default. Use <em>Download anyway</em> to force re-fetch existing tracks.</span>
+    </div>
+  </div>
+
+  <!-- ── Card 2: Saved Playlists ── -->
+  <div class="card">
+    <div class="card-hdr">
+      <div class="card-title">📑 Saved Auto-Sync Playlists</div>
+      <button class="btn btn-primary btn-sm" onclick="syncAll()" id="btnSyncAll">🔄 Sync All</button>
     </div>
 
-    <!-- Quick Add Playlist Form -->
-    <div style="margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--border);">
-      <label>Add New Playlist to Track</label>
-      <div class="row" style="margin-bottom: 8px;">
-        <input type="text" id="newPlName" placeholder="Playlist Name (e.g. Chill Beats)" style="flex: 1;" />
-        <select id="newPlMode" style="width: 120px;">
+    <div class="pl-list" id="plContainer">
+      <p style="color:var(--muted);font-size:.88rem;text-align:center;padding:2rem">Loading...</p>
+    </div>
+
+    <div style="margin-top:1.25rem;padding-top:1rem;border-top:1px solid var(--border)">
+      <label style="font-size:.9rem;font-weight:700;color:var(--text);text-transform:none;letter-spacing:normal;margin-bottom:10px;display:block">➕ Add Playlist to Track</label>
+      <div class="row" style="margin-bottom:8px">
+        <input type="text" id="newName" placeholder="Playlist name (e.g. Chill Beats)" style="flex:1" />
+        <select id="newMode" style="width:110px">
           <option value="audio">Audio</option>
           <option value="video">Video</option>
         </select>
       </div>
-      <div class="row" style="margin-bottom: 8px;">
-        <input type="text" id="newPlUrl" placeholder="Playlist URL (https://...)" style="flex: 1;" />
+      <div style="margin-bottom:8px">
+        <input type="text" id="newUrl" placeholder="Playlist URL (https://...)" />
       </div>
       <div class="row">
-        <input type="text" id="newPlFolder" placeholder="Subfolder name (optional)" style="flex: 1;" />
-        <button class="btn btn-secondary" onclick="addNewPlaylist()" id="btnAddPlaylist">+ Add</button>
+        <input type="text" id="newFolder" placeholder="Subfolder (optional, e.g. Chill)" style="flex:1" />
+        <button class="btn btn-secondary btn-sm" onclick="addPlaylist()" id="btnAdd">+ Add</button>
       </div>
     </div>
   </div>
 
-  <!-- Card 3: Live Output Terminal & Now-Downloading Widget -->
-  <div class="card console-card">
-    <!-- Active Track Widget -->
-    <div class="now-downloading-card" id="nowDownloadingCard">
-      <div class="nd-header">
+  <!-- ── Card 3: Console ── -->
+  <div class="card con-card">
+    <!-- Active download widget -->
+    <div class="nd-card" id="ndCard">
+      <div class="nd-hdr">
         <div class="nd-title" id="ndTitle">🎵 Preparing...</div>
-        <div class="nd-stage-pill" id="ndStage">Starting</div>
+        <div class="nd-pill" id="ndStage">Starting</div>
       </div>
-      <div class="progress-bar-bg">
-        <div class="progress-bar-fill" id="ndProgressBar"></div>
-      </div>
+      <div class="pb-bg"><div class="pb-fill" id="ndBar"></div></div>
       <div class="nd-meta">
-        <span id="ndPercent">0%</span>
+        <span id="ndPct">0%</span>
         <span id="ndSize">--</span>
         <span id="ndSpeed">--</span>
         <span id="ndEta">ETA --</span>
       </div>
     </div>
 
-    <div class="card-header" style="margin-bottom: 0.75rem;">
-      <div class="card-title">
-        <span>🖥️</span> Live Download Stream & Status
-      </div>
-      <button class="btn btn-secondary" style="padding: 4px 10px; font-size: 0.78rem;" onclick="clearLogs()">
-        Clear Log
-      </button>
+    <div class="card-hdr" style="margin-bottom:.75rem">
+      <div class="card-title">🖥️ Live Download Stream</div>
+      <button class="btn btn-secondary btn-sm" onclick="clearLog()">Clear</button>
     </div>
-    <div class="console-box" id="consoleBox">
-      <div class="log-line log-info"><span class="log-time">[System]</span> Ready. Ready to sync and download.</div>
+    <div class="con-box" id="conBox">
+      <div class="ll li"><span class="lt">[System]</span> Ready. Paste a URL and click Download.</div>
     </div>
   </div>
 </main>
 
 <script>
-let isDownloading = false;
-let inspectedVideos = [];
+"use strict";
 
-// Toast Notification System
-function showToast(message, type = 'info', title = '') {{
-  const container = document.getElementById('toastContainer');
-  const toast = document.createElement('div');
-  toast.className = `toast toast-${{type}}`;
+let isDownloading  = false;
+let inspectedItems = [];
 
-  const icons = {{
-    success: '✅',
-    error: '❌',
-    warning: '⚠️',
-    info: 'ℹ️'
-  }};
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
-  const titles = {{
-    success: title || 'Success',
-    error: title || 'Error',
-    warning: title || 'Warning',
-    info: title || 'Notice'
-  }};
+function esc(t) {
+  if (!t) return '';
+  return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
 
-  toast.innerHTML = `
-    <div class="toast-icon">${{icons[type] || 'ℹ️'}}</div>
-    <div class="toast-content">
-      <div class="toast-title">${{escapeHtml(titles[type])}}</div>
-      <div class="toast-desc">${{escapeHtml(message)}}</div>
-    </div>
-    <button class="toast-close" onclick="this.parentElement.remove()">✕</button>
-  `;
+function toast(msg, type='info', title='') {
+  const c = document.getElementById('toastBox');
+  const el = document.createElement('div');
+  el.className = `toast ts-${type}`;
+  const icons = {success:'✅',error:'❌',warning:'⚠️',info:'ℹ️'};
+  const titles = {success:title||'Success',error:title||'Error',warning:title||'Warning',info:title||'Notice'};
+  el.innerHTML = `<div class="t-icon">${icons[type]||'ℹ️'}</div>
+    <div class="t-body"><div class="t-title">${esc(titles[type])}</div><div class="t-desc">${esc(msg)}</div></div>
+    <button class="t-close" onclick="this.parentElement.remove()">✕</button>`;
+  c.appendChild(el);
+  setTimeout(() => { el.style.animation='tsOut .3s ease forwards'; setTimeout(()=>el.remove(),300); }, 4500);
+}
 
-  container.appendChild(toast);
-  setTimeout(() => {{
-    toast.style.animation = 'toastFadeOut 0.3s ease forwards';
-    setTimeout(() => toast.remove(), 300);
-  }}, 4000);
-}}
+function spin(btn, label) {
+  btn.disabled = true;
+  btn._orig = btn._orig || btn.innerHTML;
+  btn.innerHTML = `<span class="sp"></span> ${label}`;
+}
+function unspin(btn, label) {
+  btn.disabled = false;
+  btn.innerHTML = label || btn._orig || '';
+}
 
-function toggleFormatSelect() {{
-  const mode = document.getElementById('directMode').value;
-  document.getElementById('formatGroup').style.display = mode === 'audio' ? 'block' : 'none';
-  const outInput = document.getElementById('directOutput');
-  if (mode === 'video' && outInput.value === '{DEFAULT_MUSIC_DIR}') {{
-    outInput.value = '{DEFAULT_VIDEO_DIR}';
-  }} else if (mode === 'audio' && outInput.value === '{DEFAULT_VIDEO_DIR}') {{
-    outInput.value = '{DEFAULT_MUSIC_DIR}';
-  }}
-}}
+// ── Mode / folder helpers ────────────────────────────────────────────────────
 
-function setQuickFolder(inputId, path) {{
-  document.getElementById(inputId).value = path;
-  showToast(`Destination set to: ${{path}}`, 'info', 'Folder Selected');
-}}
+function onModeChange() {
+  const mode = document.getElementById('dlMode').value;
+  document.getElementById('fmtGroup').style.display = mode === 'audio' ? '' : 'none';
+  const out = document.getElementById('dlOutput');
+  if (mode === 'video' && out.value === 'MUSIC_DIR_PLACEHOLDER') out.value = 'VIDEO_DIR_PLACEHOLDER';
+  if (mode === 'audio' && out.value === 'VIDEO_DIR_PLACEHOLDER') out.value = 'MUSIC_DIR_PLACEHOLDER';
+}
 
-async function browseFolder(inputId) {{
+function setFolder(id, path) {
+  document.getElementById(id).value = path;
+  toast('Destination: ' + path, 'info', 'Folder Set');
+}
+
+async function browseFolder(inputId) {
   const btn = document.getElementById('btnBrowse');
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span> Browsing...';
-  const currentVal = document.getElementById(inputId).value.trim();
+  const cur = document.getElementById(inputId).value.trim();
+  spin(btn, 'Browsing...');
+  try {
+    const r = await fetch('/api/browse-folder', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({current: cur})
+    });
+    const d = await r.json();
+    if (d.folder) {
+      document.getElementById(inputId).value = d.folder;
+      toast('Selected: ' + d.folder, 'success', 'Folder Chosen');
+    } else {
+      toast('Folder selection cancelled', 'info');
+    }
+  } catch(e) {
+    toast('Folder picker error: ' + e, 'error');
+  } finally {
+    unspin(btn, '📁 Browse...');
+  }
+}
 
-  try {{
-    const res = await fetch('/api/browse-folder', {{
-      method: 'POST',
-      headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ current: currentVal }})
-    }});
-    const data = await res.json();
-    if (data.folder) {{
-      document.getElementById(inputId).value = data.folder;
-      showToast(`Selected folder: ${{data.folder}}`, 'success', 'Folder Chosen');
-    }} else {{
-      showToast('Folder selection was cancelled', 'info');
-    }}
-  }} catch (err) {{
-    showToast(`Failed to open folder picker: ${{err}}`, 'error');
-  }} finally {{
-    btn.disabled = false;
-    btn.innerHTML = '📁 Browse...';
-  }}
-}}
+function setRange(s, e) {
+  document.getElementById('dlStart').value = s;
+  document.getElementById('dlEnd').value = e || '';
+  toast(e ? `Range: #${s} – #${e}` : `From #${s} to end`, 'info', 'Range Set');
+  if (inspectedItems.length) renderInspector(inspectedItems);
+}
 
-async function inspectPlaylist() {{
-  const url = document.getElementById('directUrl').value.trim();
-  if (!url) {{
-    showToast('Please enter a YouTube playlist URL first', 'warning');
-    document.getElementById('directUrl').focus();
-    return;
-  }}
+// ── Inspector ────────────────────────────────────────────────────────────────
 
+async function inspectPlaylist() {
+  const url = document.getElementById('dlUrl').value.trim();
+  if (!url) { toast('Enter a YouTube URL first', 'warning'); return; }
   const btn = document.getElementById('btnInspect');
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span> Checking...';
+  spin(btn, 'Checking...');
+  try {
+    const r = await fetch('/api/playlist/inspect', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({url})
+    });
+    const d = await r.json();
+    if (d.error) { toast(d.error, 'error', 'Inspection Failed'); return; }
+    inspectedItems = d.items || [];
+    renderInspector(inspectedItems, d.synced_count, d.pending_count);
+    toast(`${d.count} videos found — ${d.synced_count} synced, ${d.pending_count} pending`, 'success', 'Playlist Checked');
+  } catch(e) {
+    toast('Error: ' + e, 'error');
+  } finally {
+    unspin(btn, '🔍 Check Items');
+  }
+}
 
-  try {{
-    const res = await fetch('/api/playlist/inspect', {{
-      method: 'POST',
-      headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ url }})
-    }});
-    const data = await res.json();
+function renderInspector(items, synced, pending) {
+  const syn  = synced  !== undefined ? synced  : items.filter(i=>i.is_downloaded).length;
+  const pend = pending !== undefined ? pending : items.length - syn;
+  document.getElementById('stSynced').textContent = `🟢 ${syn} Synced`;
+  document.getElementById('stPending').textContent = `⚪ ${pend} Pending`;
 
-    if (data.error) {{
-      showToast(data.error, 'error', 'Inspection Failed');
-      return;
-    }}
+  const curStart = parseInt(document.getElementById('dlStart').value) || 1;
 
-    inspectedVideos = data.items || [];
-    renderInspector(inspectedVideos, data.synced_count, data.pending_count);
-    showToast(`Found ${{data.count}} videos (${{data.synced_count}} synced, ${{data.pending_count}} pending)!`, 'success', 'Playlist Checked');
-  }} catch (err) {{
-    showToast(`Error checking playlist: ${{err}}`, 'error');
-  }} finally {{
-    btn.disabled = false;
-    btn.innerHTML = '🔍 Check Items';
-  }}
-}}
-
-function renderInspector(items, syncedCount, pendingCount) {{
-  const panel = document.getElementById('inspectorPanel');
-  const statSynced = document.getElementById('statSynced');
-  const statPending = document.getElementById('statPending');
-  const list = document.getElementById('inspectItemsList');
-
-  const sCount = syncedCount !== undefined ? syncedCount : items.filter(i => i.is_downloaded).length;
-  const pCount = pendingCount !== undefined ? pendingCount : (items.length - sCount);
-
-  statSynced.textContent = `🟢 ${{sCount}} Synced`;
-  statPending.textContent = `⚪ ${{pCount}} Pending`;
-
-  const currentStart = parseInt(document.getElementById('directStart').value) || 1;
-
-  list.innerHTML = items.map(item => `
-    <div class="inspect-row ${{item.is_downloaded ? 'synced-item' : 'pending-item'}}" id="inspectRow_${{item.index}}">
-      <div style="display:flex;align-items:center;gap:8px;flex:1;overflow:hidden;">
-        <span style="font-weight:700;color:var(--accent);min-width:26px;">#${{item.index}}</span>
-        <span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${{escapeHtml(item.title)}}">${{escapeHtml(item.title)}}</span>
+  document.getElementById('insList').innerHTML = items.map(it => `
+    <div class="ins-row ${it.is_downloaded ? 'syn' : 'pend'}" id="irow_${it.index}">
+      <div style="display:flex;align-items:center;gap:8px;flex:1;overflow:hidden">
+        <span style="font-weight:700;color:var(--accent);min-width:28px">#${it.index}</span>
+        <span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(it.title)}">${esc(it.title)}</span>
       </div>
-      <div style="display:flex;align-items:center;gap:6px;">
-        ${{item.duration ? `<span style="color:var(--text-muted);font-size:0.75rem;">${{escapeHtml(item.duration)}}</span>` : ''}}
-        ${{item.is_downloaded 
-          ? `<span class="badge-synced-pill">✓ Synced</span>
-             <button type="button" class="badge-redownload-btn" onclick="downloadSingleVideoDirect('${{item.id}}', '${{escapeHtml(item.title)}}', true)" title="Re-download this song anyway">🔄 Re-download</button>` 
-          : `<span class="badge-pending-pill">Pending</span>
-             <button type="button" class="badge-start-btn" onclick="downloadSingleVideoDirect('${{item.id}}', '${{escapeHtml(item.title)}}', false)">⬇️ Download</button>`
-        }}
-        <button type="button" class="badge-start-btn" onclick="setPlaylistStartItem(${{item.index}})" title="Start downloading playlist from here">
-          ${{item.index === currentStart ? '★ Start Here' : '# ' + item.index + ' ➔'}}
+      <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
+        ${it.duration ? `<span style="color:var(--muted);font-size:.75rem">${esc(it.duration)}</span>` : ''}
+        ${it.is_downloaded
+          ? `<span class="bs bs-syn">✓ Synced</span>
+             <button class="pb-redl" onclick="dlSingle('${esc(it.id)}','${esc(it.title)}',true)">🔄 Re-dl</button>`
+          : `<span class="bs bs-pend">Pending</span>
+             <button class="pb-dl" onclick="dlSingle('${esc(it.id)}','${esc(it.title)}',false)">⬇️ Download</button>`
+        }
+        <button class="pb-dl" onclick="setStartItem(${it.index})" style="${it.index===curStart?'background:var(--primary);color:#fff':''}">
+          ${it.index === curStart ? '★ Start' : `#${it.index}→`}
         </button>
       </div>
-    </div>
-  `).join('');
+    </div>`).join('');
 
-  panel.style.display = 'flex';
-}}
+  document.getElementById('inspectorPanel').style.display = 'flex';
+}
 
-function closeInspector() {{
+function closeInspector() {
   document.getElementById('inspectorPanel').style.display = 'none';
-}}
+}
 
-function setPlaylistStartItem(idx) {{
-  document.getElementById('directStart').value = idx;
-  showToast(`Will start downloading from video #${{idx}}`, 'info', 'Start Video Set');
-  if (inspectedVideos.length > 0) {{
-    renderInspector(inspectedVideos);
-  }}
-}}
+function setStartItem(idx) {
+  document.getElementById('dlStart').value = idx;
+  toast(`Start set to video #${idx}`, 'info', 'Start Updated');
+  if (inspectedItems.length) renderInspector(inspectedItems);
+}
 
-function setPlaylistRange(startIdx, endIdx) {{
-  document.getElementById('directStart').value = startIdx || 1;
-  document.getElementById('directEnd').value = endIdx || '';
-  const desc = endIdx ? `Videos #${{startIdx}} to #${{endIdx}}` : `From video #${{startIdx}} to End`;
-  showToast(`Range set: ${{desc}}`, 'info', 'Range Updated');
-  if (inspectedVideos.length > 0) {{
-    renderInspector(inspectedVideos);
-  }}
-}}
-
-async function downloadSingleVideoDirect(vidId, title, force) {{
-  const videoUrl = `https://www.youtube.com/watch?v=${{vidId}}`;
-  const mode = document.getElementById('directMode').value;
-  const format = document.getElementById('directFormat').value;
-  const output = document.getElementById('directOutput').value.trim();
-
-  showToast(`Downloading '${{title.substring(0, 30)}}...'`, 'info', force ? 'Re-downloading Anyway' : 'Downloading Track');
-
-  await fetch('/api/download', {{
-    method: 'POST',
-    headers: {{ 'Content-Type': 'application/json' }},
-    body: JSON.stringify({{ url: videoUrl, mode, format, output, force }})
-  }});
+async function dlSingle(vid, title, force) {
+  if (isDownloading) { toast('A download is already running. Stop it first.', 'warning'); return; }
+  const url    = `https://www.youtube.com/watch?v=${vid}`;
+  const mode   = document.getElementById('dlMode').value;
+  const format = document.getElementById('dlFormat').value;
+  const output = document.getElementById('dlOutput').value.trim();
+  toast(`${force ? 'Re-downloading' : 'Downloading'}: ${title.slice(0,40)}...`, 'info', force?'Force Re-download':'Download');
+  try {
+    const r = await fetch('/api/download', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({url, mode, format, output, start:1, end:null, force, single:true})
+    });
+    const d = await r.json();
+    if (d.error) toast(d.error, 'error');
+  } catch(e) { toast('Error: '+e, 'error'); }
   fetchStatus();
-}}
+}
 
-async function fetchStatus() {{
-  try {{
-    const res = await fetch('/api/status');
-    const data = await res.json();
-    document.getElementById('archiveCount').textContent = data.archive_count;
-    isDownloading = data.is_downloading;
-    
-    const btn = document.getElementById('btnDownload');
-    const btnText = document.getElementById('btnDownloadText');
-    const btnStop = document.getElementById('btnStop');
-    const ndCard = document.getElementById('nowDownloadingCard');
+// ── Download ─────────────────────────────────────────────────────────────────
 
-    if (isDownloading) {{
+async function startDownload() {
+  const url    = document.getElementById('dlUrl').value.trim();
+  const mode   = document.getElementById('dlMode').value;
+  const format = document.getElementById('dlFormat').value;
+  const output = document.getElementById('dlOutput').value.trim();
+  const start  = parseInt(document.getElementById('dlStart').value) || 1;
+  const endRaw = parseInt(document.getElementById('dlEnd').value);
+  const end    = isNaN(endRaw) ? null : endRaw;
+  const force  = document.getElementById('dlForce').checked;
+
+  if (!url) { toast('Please enter a YouTube URL', 'warning'); return; }
+
+  const btn  = document.getElementById('btnDownload');
+  const btnT = document.getElementById('btnDlText');
+  spin(btn, 'Starting...');
+
+  try {
+    const r = await fetch('/api/download', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({url, mode, format, output, start, end, force, single:false})
+    });
+    const d = await r.json();
+    if (d.error) {
+      toast(d.error, 'error', 'Download Error');
+    } else {
+      toast(force ? 'Force re-download started!' : 'Incremental sync started!', 'success', 'Download Started');
+    }
+  } catch(e) {
+    toast('Failed to start: '+e, 'error');
+  } finally {
+    unspin(btn, '');
+    btnT.textContent = 'Download / Sync Incremental';
+    fetchStatus();
+  }
+}
+
+async function stopDownload() {
+  const btn = document.getElementById('btnStop');
+  spin(btn, 'Stopping...');
+  try {
+    await fetch('/api/stop', {method:'POST'});
+    toast('Download stopped', 'warning', 'Stopped');
+  } catch(e) {
+    toast('Stop error: '+e, 'error');
+  } finally {
+    unspin(btn, '⏹ Stop');
+    fetchStatus();
+  }
+}
+
+// ── Status polling ───────────────────────────────────────────────────────────
+
+async function fetchStatus() {
+  try {
+    const r = await fetch('/api/status');
+    const d = await r.json();
+    document.getElementById('arcCount').textContent = d.archive_count;
+    isDownloading = d.is_downloading;
+
+    const btn  = document.getElementById('btnDownload');
+    const btnT = document.getElementById('btnDlText');
+    const stop = document.getElementById('btnStop');
+    const nd   = document.getElementById('ndCard');
+
+    if (d.is_downloading) {
       btn.disabled = true;
-      btnText.innerHTML = '<span class="spinner"></span> Downloading...';
-      btnStop.style.display = 'inline-flex';
-      ndCard.style.display = 'flex';
-
-      // Update active download widget
-      const ad = data.active_download || {{}};
-      if (ad.title) {{
-        document.getElementById('ndTitle').textContent = `🎵 ${{ad.title}}`;
-      }}
+      btnT.innerHTML = '<span class="sp"></span> Downloading...';
+      stop.style.display = 'inline-flex';
+      nd.style.display = 'flex';
+      const ad = d.active_download || {};
+      if (ad.title) document.getElementById('ndTitle').textContent = '🎵 ' + ad.title;
       document.getElementById('ndStage').textContent = ad.status || 'Downloading';
       const pct = (ad.percent || 0).toFixed(1);
-      document.getElementById('ndProgressBar').style.width = `${{pct}}%`;
-      document.getElementById('ndPercent').textContent = `${{pct}}%`;
-      document.getElementById('ndSize').textContent = ad.size || '--';
+      document.getElementById('ndBar').style.width   = pct + '%';
+      document.getElementById('ndPct').textContent   = pct + '%';
+      document.getElementById('ndSize').textContent  = ad.size  || '--';
       document.getElementById('ndSpeed').textContent = ad.speed || '--';
-      document.getElementById('ndEta').textContent = ad.eta ? `ETA ${{ad.eta}}` : '--';
-    }} else {{
+      document.getElementById('ndEta').textContent   = ad.eta ? 'ETA ' + ad.eta : '--';
+    } else {
       btn.disabled = false;
-      btnText.textContent = 'Download / Sync Incremental';
-      btnStop.style.display = 'none';
-      if (!data.active_download || data.active_download.status === 'Completed' || data.active_download.status === 'Idle') {{
-        ndCard.style.display = 'none';
-      }}
-    }}
-  }} catch (err) {{
-    console.error(err);
-  }}
-}}
+      btnT.textContent = 'Download / Sync Incremental';
+      stop.style.display = 'none';
+      const st = (d.active_download || {}).status || '';
+      if (!st || st === 'Idle' || st === 'Completed' || st === 'Stopped') {
+        nd.style.display = 'none';
+      }
+    }
+  } catch(_) {}
+}
 
-async function loadPlaylists() {{
-  try {{
-    const res = await fetch('/api/playlists');
-    const list = await res.json();
-    const container = document.getElementById('playlistContainer');
-    if (list.length === 0) {{
-      container.innerHTML = '<p style="color: var(--text-muted); font-size: 0.88rem; text-align: center; padding: 2rem;">No saved playlists yet. Add one below!</p>';
+// ── Saved playlists ──────────────────────────────────────────────────────────
+
+async function loadPlaylists() {
+  try {
+    const r = await fetch('/api/playlists');
+    const list = await r.json();
+    const c = document.getElementById('plContainer');
+    if (!list.length) {
+      c.innerHTML = '<p style="color:var(--muted);font-size:.88rem;text-align:center;padding:2rem">No saved playlists yet. Add one below!</p>';
       return;
-    }}
-    container.innerHTML = list.map((p, idx) => `
-      <div class="playlist-item">
+    }
+    c.innerHTML = list.map((p, i) => `
+      <div class="pl-item" id="plitem_${i}">
         <div class="pl-info">
-          <h4>${{escapeHtml(p.name)}} <span style="font-size: 0.75rem; color: var(--accent); font-weight: normal;">[${{p.mode.toUpperCase()}}]</span></h4>
-          <p>${{escapeHtml(p.url.substring(0, 45))}}...</p>
+          <h4>${esc(p.name)} <span style="font-size:.75rem;color:var(--accent);font-weight:normal">[${(p.mode||'audio').toUpperCase()}]</span></h4>
+          <p title="${esc(p.url)}">${esc(p.url.length>50 ? p.url.slice(0,50)+'…' : p.url)}</p>
         </div>
-        <div class="pl-actions">
-          <button class="btn btn-secondary" id="btnSyncPl_${{idx}}" style="padding: 6px 10px; font-size: 0.8rem;" onclick="syncSinglePlaylist('${{encodeURIComponent(p.url)}}', '${{p.mode}}', ${{idx}})">
-            Sync
-          </button>
-          <button class="btn btn-danger" id="btnDelPl_${{idx}}" style="padding: 6px 10px; font-size: 0.8rem;" onclick="removePlaylist(${{idx}}, '${{escapeHtml(p.name)}}')">
-            ✕
-          </button>
+        <div class="pl-btns">
+          <button class="btn btn-secondary btn-sm" id="bsync_${i}" onclick="syncOne(${i})">▶ Sync</button>
+          <button class="btn btn-danger btn-sm"    id="bdel_${i}"  onclick="removePlaylist(${i},'${esc(p.name)}')">✕</button>
         </div>
-      </div>
-    `).join('');
-  }} catch (err) {{
-    console.error(err);
-  }}
-}}
+      </div>`).join('');
+    window._playlists = list;
+  } catch(e) { console.error(e); }
+}
 
-async function addNewPlaylist() {{
-  const name = document.getElementById('newPlName').value.trim();
-  const url = document.getElementById('newPlUrl').value.trim();
-  const mode = document.getElementById('newPlMode').value;
-  const subfolder = document.getElementById('newPlFolder').value.trim();
-  const btn = document.getElementById('btnAddPlaylist');
-
-  if (!name || !url) {{
-    showToast('Please enter both playlist name and YouTube URL', 'warning', 'Missing Fields');
-    return;
-  }}
-
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span> Adding...';
-
-  try {{
-    const res = await fetch('/api/playlists/add', {{
-      method: 'POST',
-      headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ name, url, mode, subfolder }})
-    }});
-    const data = await res.json();
-    if (data.success) {{
-      showToast(`Added playlist: ${{name}}`, 'success', 'Playlist Saved');
-      document.getElementById('newPlName').value = '';
-      document.getElementById('newPlUrl').value = '';
-      document.getElementById('newPlFolder').value = '';
+async function addPlaylist() {
+  const name   = document.getElementById('newName').value.trim();
+  const url    = document.getElementById('newUrl').value.trim();
+  const mode   = document.getElementById('newMode').value;
+  const folder = document.getElementById('newFolder').value.trim();
+  if (!name || !url) { toast('Enter both name and URL', 'warning', 'Missing Fields'); return; }
+  const btn = document.getElementById('btnAdd');
+  spin(btn, 'Adding...');
+  try {
+    const r = await fetch('/api/playlists/add', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name, url, mode, subfolder: folder})
+    });
+    const d = await r.json();
+    if (d.success) {
+      toast(`Added: ${name}`, 'success', 'Playlist Saved');
+      document.getElementById('newName').value   = '';
+      document.getElementById('newUrl').value    = '';
+      document.getElementById('newFolder').value = '';
       loadPlaylists();
-    }} else {{
-      showToast(data.error || 'Failed to add playlist', 'error');
-    }}
-  }} catch (err) {{
-    showToast(`Error: ${{err}}`, 'error');
-  }} finally {{
-    btn.disabled = false;
-    btn.innerHTML = '+ Add';
-  }}
-}}
+    } else {
+      toast(d.error || 'Failed', 'error');
+    }
+  } catch(e) { toast('Error: '+e,'error'); }
+  finally { unspin(btn, '+ Add'); }
+}
 
-async function removePlaylist(idx, name) {{
-  if (!confirm(`Remove playlist '${{name}}' from auto-sync list?`)) return;
+async function removePlaylist(idx, name) {
+  if (!confirm(`Remove "${name}" from auto-sync?`)) return;
+  const btn = document.getElementById(`bdel_${idx}`);
+  if (btn) spin(btn, '');
+  try {
+    const r = await fetch('/api/playlists/remove', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({index: idx})
+    });
+    const d = await r.json();
+    if (d.success) { toast(`Removed: ${name}`, 'info', 'Removed'); loadPlaylists(); }
+    else toast(d.error || 'Failed', 'error');
+  } catch(e) { toast('Error: '+e,'error'); }
+}
 
-  const btn = document.getElementById(`btnDelPl_${{idx}}`);
-  if (btn) {{
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span>';
-  }}
-
-  try {{
-    const res = await fetch('/api/playlists/remove', {{
-      method: 'POST',
-      headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ index: idx }})
-    }});
-    const data = await res.json();
-    if (data.success) {{
-      showToast(`Removed playlist: ${{name}}`, 'info', 'Removed');
-      loadPlaylists();
-    }} else {{
-      showToast(data.error || 'Failed to remove playlist', 'error');
-    }}
-  }} catch (err) {{
-    showToast(`Error: ${{err}}`, 'error');
-  }}
-}}
-
-async function handleDirectDownload(e) {{
-  e.preventDefault();
-  const url = document.getElementById('directUrl').value.trim();
-  const mode = document.getElementById('directMode').value;
-  const format = document.getElementById('directFormat').value;
-  const output = document.getElementById('directOutput').value.trim();
-  const start = parseInt(document.getElementById('directStart').value) || 1;
-  const end = parseInt(document.getElementById('directEnd').value) || null;
-  const force = document.getElementById('directForce').checked;
-
-  document.getElementById('btnDownload').disabled = true;
-  document.getElementById('btnDownloadText').innerHTML = '<span class="spinner"></span> Starting...';
-
-  try {{
-    const res = await fetch('/api/download', {{
-      method: 'POST',
-      headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ url, mode, format, output, start, end, force }})
-    }});
-    const data = await res.json();
-    if (data.error) {{
-      showToast(data.error, 'error', 'Download Error');
-    }} else {{
-      showToast(force ? 'Download started (Force Re-download ON)!' : 'Incremental sync started!', 'success', 'Started');
-    }}
-  }} catch (err) {{
-    showToast(`Failed to start download: ${{err}}`, 'error');
-  }}
-  fetchStatus();
-}}
-
-async function syncSinglePlaylist(urlEnc, mode, idx) {{
-  const url = decodeURIComponent(urlEnc);
-  const btn = document.getElementById(`btnSyncPl_${{idx}}`);
-  if (btn) {{
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span>';
-  }}
-
-  try {{
-    const res = await fetch('/api/download', {{
-      method: 'POST',
-      headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ url, mode, format: 'mp3', output: '', start: 1, force: false }})
-    }});
-    const data = await res.json();
-    if (data.error) {{
-      showToast(data.error, 'error');
-    }} else {{
-      showToast('Sync job started for playlist!', 'info', 'Syncing');
-    }}
-  }} catch (err) {{
-    showToast(`Error: ${{err}}`, 'error');
-  }} finally {{
+async function syncOne(idx) {
+  const playlists = window._playlists || [];
+  const p = playlists[idx];
+  if (!p) { toast('Playlist not found', 'error'); return; }
+  if (isDownloading) { toast('A download is already running', 'warning'); return; }
+  const btn = document.getElementById(`bsync_${idx}`);
+  if (btn) spin(btn, '');
+  try {
+    const r = await fetch('/api/download', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        url: p.url,
+        mode: p.mode || 'audio',
+        format: 'mp3',
+        output: p.subfolder ? '' : '',   // server resolves with subfolder from body
+        subfolder: p.subfolder || '',
+        start: 1, end: null, force: false, single: false
+      })
+    });
+    const d = await r.json();
+    if (d.error) toast(d.error, 'error');
+    else toast(`Sync started: ${p.name}`, 'success', 'Syncing');
+  } catch(e) { toast('Error: '+e,'error'); }
+  finally {
+    if (btn) unspin(btn, '▶ Sync');
     fetchStatus();
-    if (btn) {{
-      btn.disabled = false;
-      btn.innerHTML = 'Sync';
-    }}
-  }}
-}}
+  }
+}
 
-async function syncAllPlaylists() {{
+async function syncAll() {
+  if (isDownloading) { toast('A download is already running. Stop it first.', 'warning'); return; }
   const btn = document.getElementById('btnSyncAll');
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span> Syncing...';
+  spin(btn, 'Syncing...');
+  try {
+    const r = await fetch('/api/sync-all', {method:'POST'});
+    const d = await r.json();
+    if (d.error) toast(d.error, 'error');
+    else toast('Auto-sync started for all playlists!', 'success', 'Syncing All');
+  } catch(e) { toast('Error: '+e,'error'); }
+  finally { unspin(btn,'🔄 Sync All'); fetchStatus(); }
+}
 
-  try {{
-    const res = await fetch('/api/sync-all', {{ method: 'POST' }});
-    const data = await res.json();
-    if (data.error) {{
-      showToast(data.error, 'error');
-    }} else {{
-      showToast('Auto-Sync started for all saved playlists!', 'success', 'Syncing All');
-    }}
-  }} catch (err) {{
-    showToast(`Error: ${{err}}`, 'error');
-  }} finally {{
+// ── Shutdown ─────────────────────────────────────────────────────────────────
+
+async function shutdownApp() {
+  if (!confirm('Shutdown YouTube Sync? (Closes background server)')) return;
+  const btn = document.getElementById('btnExit');
+  spin(btn, 'Exiting...');
+  toast('Shutting down server...', 'info', 'Shutting Down');
+  try { await fetch('/api/shutdown', {method:'POST'}); } catch(_) {}
+  setTimeout(() => {
+    window.close();
+    document.body.innerHTML = '<div style="display:flex;height:100vh;align-items:center;justify-content:center;color:white;font-family:sans-serif;background:#090d16"><h1>✅ App closed. You may close this tab.</h1></div>';
+  }, 500);
+}
+
+function clearLog() {
+  document.getElementById('conBox').innerHTML = '<div class="ll li"><span class="lt">[System]</span> Log cleared.</div>';
+  toast('Log cleared', 'info');
+}
+
+// ── SSE log stream ───────────────────────────────────────────────────────────
+
+function startSSE() {
+  const es = new EventSource('/api/logs/stream');
+  es.onmessage = e => {
+    try {
+      const entry = JSON.parse(e.data);
+      const box = document.getElementById('conBox');
+      const d   = document.createElement('div');
+      const cls = {header:'lh',skip:'lsk',progress:'lpr',download:'ldl',audio:'lau',success:'lsu',error:'ler',warning:'lw',info:'li'}[entry.type] || 'li';
+      d.className = `ll ${cls}`;
+      d.innerHTML = `<span class="lt">[${entry.time}]</span> ${esc(entry.text)}`;
+      box.appendChild(d);
+      box.scrollTop = box.scrollHeight;
+    } catch(_) {}
     fetchStatus();
-    btn.disabled = false;
-    btn.innerHTML = '🔄 Sync All';
-  }}
-}}
+  };
+  es.onerror = () => setTimeout(startSSE, 3000);
+}
 
-async function stopDownload() {{
-  const btn = document.getElementById('btnStop');
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span> Stopping...';
+// ── Heartbeat + status polling ───────────────────────────────────────────────
 
-  try {{
-    await fetch('/api/stop', {{ method: 'POST' }});
-    showToast('Download process stopped', 'warning', 'Stopped');
-  }} catch (err) {{
-    showToast(`Error stopping download: ${{err}}`, 'error');
-  }} finally {{
-    fetchStatus();
-    btn.disabled = false;
-    btn.innerHTML = 'Stop';
-  }}
-}}
+setInterval(() => fetch('/api/heartbeat', {method:'POST'}).catch(()=>{}), 3000);
+setInterval(fetchStatus, 1500);
 
-async function shutdownApp() {{
-  if (confirm("Shutdown YouTube Sync application?")) {{
-    const btn = document.getElementById('btnShutdown');
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span> Exiting...';
-    showToast('Stopping server and closing app...', 'info', 'Shutting Down');
-    await fetch('/api/shutdown', {{ method: 'POST' }});
-    setTimeout(() => {{
-      window.close();
-      document.body.innerHTML = '<div style="display:flex;height:100vh;align-items:center;justify-content:center;color:white;font-family:sans-serif;"><h1>App Closed. You may close this tab.</h1></div>';
-    }}, 400);
-  }}
-}}
-
-function clearLogs() {{
-  document.getElementById('consoleBox').innerHTML = '<div class="log-line log-info"><span class="log-time">[System]</span> Log cleared.</div>';
-  showToast('Console logs cleared', 'info');
-}}
-
-function escapeHtml(text) {{
-  if (!text) return '';
-  return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}}
-
-function setupSSE() {{
-  const evtSource = new EventSource('/api/logs/stream');
-  evtSource.onmessage = function(e) {{
-    const entry = JSON.parse(e.data);
-    const box = document.getElementById('consoleBox');
-    const div = document.createElement('div');
-    div.className = `log-line log-${{entry.type || 'info'}}`;
-    div.innerHTML = `<span class="log-time">[${{entry.time}}]</span> ${{escapeHtml(entry.text)}}`;
-    box.appendChild(div);
-    box.scrollTop = box.scrollHeight;
-    fetchStatus();
-  }};
-}}
-
-// Heartbeat to automatically shut down backend if window is closed
-setInterval(() => {{
-  fetch('/api/heartbeat', {{ method: 'POST' }}).catch(() => {{}});
-}}, 3000);
-
-// Status polling every 1 second when active
-setInterval(() => {{
-  if (isDownloading) {{
-    fetchStatus();
-  }}
-}}, 1000);
-
-// Init
+// ── Init ─────────────────────────────────────────────────────────────────────
 fetchStatus();
 loadPlaylists();
-setupSSE();
+startSSE();
 </script>
 </body>
 </html>
 """
 
-class RequestHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        # Silence default terminal request logs
-        pass
+# Replace placeholders at import time
+_HTML = (
+    _HTML
+    .replace("MUSIC_DIR_PLACEHOLDER", str(DEFAULT_MUSIC_DIR))
+    .replace("VIDEO_DIR_PLACEHOLDER", str(DEFAULT_VIDEO_DIR))
+    .replace("DL_DIR_PLACEHOLDER",    str(DEFAULT_DOWNLOADS_DIR))
+)
 
-    def _send_json(self, data, status=200):
-        body = json.dumps(data).encode("utf-8")
+
+# ─── HTTP Request Handler ──────────────────────────────────────────────────────
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass  # silence default logs
+
+    def _json(self, data, status=200):
+        body = json.dumps(data).encode()
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type",   "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
 
+    def _read_body(self) -> Dict:
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            return json.loads(raw.decode())
+        except Exception:
+            return {}
+
     def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path
+        path = urllib.parse.urlparse(self.path).path
 
         if path == "/":
-            body = HTML_PAGE.encode("utf-8")
+            body = _HTML.encode()
             self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Type",   "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
         elif path == "/api/status":
             with app_state["lock"]:
-                self._send_json({
+                self._json({
                     "is_downloading": app_state["is_downloading"],
-                    "archive_count": get_archive_count(),
-                    "task_name": app_state["current_task_name"],
-                    "active_download": dict(app_state["active_download"])
+                    "archive_count":  get_archive_count(),
+                    "task_url":       app_state["current_task_url"],
+                    "active_download": dict(app_state["active_download"]),
                 })
+
         elif path == "/api/playlists":
-            self._send_json(get_saved_playlists())
+            self._json(get_saved_playlists())
+
         elif path == "/api/logs/stream":
             self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Type",  "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
+            self.send_header("Connection",    "keep-alive")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
 
-            queue = []
-            lock = threading.Lock()
+            q, lock = [], threading.Lock()
 
-            def listener(entry):
+            def cb(entry):
                 with lock:
-                    queue.append(entry)
+                    q.append(entry)
 
-            log_subscribers.append(listener)
+            _log_subscribers.append(cb)
 
-            # Send historical logs first
+            # Replay recent history
             with app_state["lock"]:
-                for h in app_state["log_history"][-30:]:
-                    data = f"data: {json.dumps(h)}\\n\\n"
-                    try:
-                        self.wfile.write(data.encode("utf-8"))
-                    except Exception:
-                        break
+                history = list(app_state["log_history"][-40:])
+            for h in history:
                 try:
-                    self.wfile.flush()
+                    self.wfile.write(("data: " + json.dumps(h) + "\n\n").encode())
                 except Exception:
-                    pass
+                    break
+            try:
+                self.wfile.flush()
+            except Exception:
+                pass
 
             try:
                 while not app_state["shutdown_requested"]:
-                    to_send = []
                     with lock:
-                        if queue:
-                            to_send = list(queue)
-                            queue.clear()
-                    for item in to_send:
-                        data = f"data: {json.dumps(item)}\\n\\n"
-                        self.wfile.write(data.encode("utf-8"))
-                    if to_send:
+                        batch = list(q); q.clear()
+                    for item in batch:
+                        self.wfile.write(("data: " + json.dumps(item) + "\n\n").encode())
+                    if batch:
                         self.wfile.flush()
                     time.sleep(0.1)
             except Exception:
                 pass
             finally:
-                if listener in log_subscribers:
-                    log_subscribers.remove(listener)
+                if cb in _log_subscribers:
+                    _log_subscribers.remove(cb)
+
         else:
-            self.send_error(404, "Not Found")
+            self.send_error(404)
 
     def do_POST(self):
-        parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path
-        length = int(self.headers.get('Content-Length', 0))
-        post_data = self.rfile.read(length) if length > 0 else b'{}'
-        body = {}
-        if post_data:
-            try:
-                body = json.loads(post_data.decode('utf-8'))
-            except Exception:
-                body = {}
+        path = urllib.parse.urlparse(self.path).path
+        body = self._read_body()
 
+        # ── Heartbeat ──
         if path == "/api/heartbeat":
             with app_state["lock"]:
                 app_state["last_heartbeat"] = time.time()
-            self._send_json({"status": "ok"})
+            self._json({"ok": True})
 
+        # ── Browse folder (runs in this thread – POST thread, not main) ──
         elif path == "/api/browse-folder":
-            current_val = body.get("current", "")
-            selected = choose_folder_dialog(current_val)
-            if selected:
-                self._send_json({"folder": selected})
+            folder = choose_folder_dialog(body.get("current", ""))
+            if folder:
+                self._json({"folder": folder})
             else:
-                self._send_json({"cancelled": True})
+                self._json({"cancelled": True})
 
+        # ── Inspect playlist ──
         elif path == "/api/playlist/inspect":
             url = body.get("url", "").strip()
             if not url:
-                self._send_json({"error": "Please provide a playlist URL"}, 400)
-                return
-            res = inspect_playlist_items(url)
-            self._send_json(res)
+                self._json({"error": "URL required"}, 400); return
+            self._json(inspect_playlist(url))
 
+        # ── Add playlist ──
         elif path == "/api/playlists/add":
-            name = body.get("name", "").strip()
-            url = body.get("url", "").strip()
-            mode = body.get("mode", "audio")
-            subfolder = body.get("subfolder", "").strip()
-            if name and url:
-                playlists = get_saved_playlists()
-                playlists.append({"name": name, "url": url, "mode": mode, "subfolder": subfolder})
-                save_playlists(playlists)
-                broadcast_log(f"Saved new playlist: '{name}'", "success")
-                self._send_json({"success": True})
-            else:
-                self._send_json({"error": "Missing name or url"}, 400)
+            name  = body.get("name",      "").strip()
+            url   = body.get("url",       "").strip()
+            mode  = body.get("mode",      "audio")
+            sub   = body.get("subfolder", "").strip()
+            if not name or not url:
+                self._json({"error": "name and url required"}, 400); return
+            pls = get_saved_playlists()
+            pls.append({"name": name, "url": url, "mode": mode, "subfolder": sub})
+            save_playlists(pls)
+            broadcast_log(f"✅ Saved playlist: '{name}'", "success")
+            self._json({"success": True})
 
+        # ── Remove playlist ──
         elif path == "/api/playlists/remove":
             idx = body.get("index")
-            if idx is not None and isinstance(idx, int):
-                playlists = get_saved_playlists()
-                if 0 <= idx < len(playlists):
-                    removed = playlists.pop(idx)
-                    save_playlists(playlists)
-                    broadcast_log(f"Removed playlist: '{removed['name']}'", "info")
-                    self._send_json({"success": True})
-                    return
-            self._send_json({"error": "Invalid index"}, 400)
+            if not isinstance(idx, int):
+                self._json({"error": "invalid index"}, 400); return
+            pls = get_saved_playlists()
+            if 0 <= idx < len(pls):
+                removed = pls.pop(idx)
+                save_playlists(pls)
+                broadcast_log(f"ℹ️ Removed playlist: '{removed['name']}'", "info")
+                self._json({"success": True})
+            else:
+                self._json({"error": "index out of range"}, 400)
 
+        # ── Download ──
         elif path == "/api/download":
-            url = body.get("url", "").strip()
-            mode = body.get("mode", "audio")
-            fmt = body.get("format", "mp3")
-            out = body.get("output", "")
-            start = int(body.get("start", 1) or 1)
-            end_val = body.get("end")
-            end = int(end_val) if end_val else None
-            force = bool(body.get("force", False))
+            url    = body.get("url",    "").strip()
+            mode   = body.get("mode",   "audio")
+            fmt    = body.get("format", "mp3")
+            out    = body.get("output", "").strip()
+            start  = int(body.get("start", 1) or 1)
+            end_r  = body.get("end")
+            end    = int(end_r) if end_r else None
+            force  = bool(body.get("force", False))
+            single = bool(body.get("single", False))
+            sub    = body.get("subfolder", "").strip()
 
             if not url:
-                self._send_json({"error": "No URL provided"}, 400)
-                return
+                self._json({"error": "URL required"}, 400); return
             if app_state["is_downloading"]:
-                self._send_json({"error": "Download already in progress"}, 409)
-                return
-            threading.Thread(target=run_download_job, args=(url, mode, fmt, out, start, end, force), daemon=True).start()
-            self._send_json({"success": True})
+                self._json({"error": "A download is already running. Stop it first."}, 409); return
 
+            # Resolve output path (subfolder for saved-playlist sync)
+            if not out and sub:
+                base = DEFAULT_MUSIC_DIR if mode == "audio" else DEFAULT_VIDEO_DIR
+                out  = str(base / sub)
+
+            threading.Thread(
+                target=run_download_job,
+                args=(url, mode, fmt, out, start, end, force, single),
+                daemon=True,
+            ).start()
+            self._json({"success": True})
+
+        # ── Sync all ──
         elif path == "/api/sync-all":
             if app_state["is_downloading"]:
-                self._send_json({"error": "Download already in progress"}, 409)
-                return
+                self._json({"error": "A download is already running."}, 409); return
             threading.Thread(target=run_sync_all_job, daemon=True).start()
-            self._send_json({"success": True})
+            self._json({"success": True})
 
+        # ── Stop ──
         elif path == "/api/stop":
             with app_state["lock"]:
-                if app_state["current_process"]:
-                    app_state["current_process"].terminate()
-            self._send_json({"success": True})
+                proc = app_state["current_process"]
+            if proc:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            self._json({"success": True})
 
+        # ── Shutdown ──
         elif path == "/api/shutdown":
-            broadcast_log("Shutting down GUI server...", "warning")
+            broadcast_log("Shutting down...", "warning")
             app_state["shutdown_requested"] = True
-            self._send_json({"success": True})
-            threading.Thread(target=lambda: (time.sleep(0.5), os._exit(0)), daemon=True).start()
+            self._json({"success": True})
+            threading.Thread(target=lambda: (time.sleep(0.6), os._exit(0)), daemon=True).start()
+
         else:
-            self.send_error(404, "Not Found")
+            self.send_error(404)
 
-def find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('127.0.0.1', 0))
-        return s.getsockname()[1]
 
-def auto_shutdown_watcher():
-    """Shuts down server if no heartbeat for 12 seconds after initial grace period."""
-    time.sleep(12) # Initial grace period for browser to open
+# ─── Auto-shutdown watcher ─────────────────────────────────────────────────────
+
+def _shutdown_watcher():
+    """Kill server if browser heartbeat is absent for 20 s after 20 s grace."""
+    time.sleep(20)  # grace: browser may take time to launch
     while not app_state["shutdown_requested"]:
-        time.sleep(2)
+        time.sleep(3)
         with app_state["lock"]:
             elapsed = time.time() - app_state["last_heartbeat"]
-            if elapsed > 12:
-                print("\n[!] Browser window closed. Shutting down GUI server cleanly (Zero background 24/7).")
-                app_state["shutdown_requested"] = True
-                os._exit(0)
+        if elapsed > 20:
+            print("\n[yt-sync] Browser window closed – shutting down.")
+            os._exit(0)
+
+
+# ─── Browser launcher ─────────────────────────────────────────────────────────
+
+def _open_browser(url: str):
+    time.sleep(0.8)
+
+    if sys.platform.startswith("win"):
+        for exe in [
+            os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
+            os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
+            os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+        ]:
+            if os.path.isfile(exe):
+                try:
+                    subprocess.Popen([exe, f"--app={url}"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return
+                except Exception:
+                    pass
+        import webbrowser
+        webbrowser.open(url)
+        return
+
+    # Linux / macOS – try app-mode browser in preference order
+    browsers = [
+        shutil.which("opera-gx"),
+        shutil.which("opera"),
+        "/usr/bin/chromium",
+        shutil.which("chromium"),
+        shutil.which("google-chrome"),
+        shutil.which("brave"),
+    ]
+    for b in browsers:
+        if b and os.path.isfile(b):
+            try:
+                subprocess.Popen([b, f"--app={url}"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+            except Exception:
+                pass
+
+    import webbrowser
+    webbrowser.open(url)
+
+
+# ─── Entry Point ───────────────────────────────────────────────────────────────
 
 def main():
-    port = find_free_port()
-    server = ThreadingHTTPServer(('127.0.0.1', port), RequestHandler)
-    url = f"http://127.0.0.1:{port}"
+    port = 0
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
 
-    print("==========================================================")
-    print("  YouTube Playlist Incremental Downloader - GUI")
-    print("==========================================================")
-    print(f"Server URL:        {url}")
-    print("Behavior:          Runs on-demand. Auto-stops on window close.")
-    print("==========================================================")
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    srv_url = f"http://127.0.0.1:{port}"
 
-    def open_window():
-        time.sleep(0.5)
-        if sys.platform.startswith("win"):
-            edge_paths = [
-                os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
-                os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
-                os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
-                os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
-            ]
-            for ep in edge_paths:
-                if os.path.exists(ep):
-                    try:
-                        subprocess.Popen([ep, f"--app={url}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        return
-                    except Exception:
-                        pass
-            import webbrowser
-            webbrowser.open(url)
-        else:
-            if Path("/usr/bin/chromium").exists():
-                subprocess.Popen(["/usr/bin/chromium", f"--app={url}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            elif Path("/usr/bin/google-chrome").exists():
-                subprocess.Popen(["/usr/bin/google-chrome", f"--app={url}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            else:
-                import webbrowser
-                webbrowser.open(url)
+    print("=" * 58)
+    print("  YouTube Playlist Incremental Downloader – GUI")
+    print("=" * 58)
+    print(f"  URL: {srv_url}")
+    print("  Auto-closes when browser window is shut.")
+    print("=" * 58)
 
-    threading.Thread(target=open_window, daemon=True).start()
-    threading.Thread(target=auto_shutdown_watcher, daemon=True).start()
+    threading.Thread(target=_open_browser, args=(srv_url,), daemon=True).start()
+    threading.Thread(target=_shutdown_watcher, daemon=True).start()
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nExiting cleanly...")
+        print("\n[yt-sync] Stopped.")
     finally:
         server.server_close()
+
 
 if __name__ == "__main__":
     main()
